@@ -1,0 +1,44 @@
+{
+ "budget": {
+  "bpw": {
+   "r8": 2.0622265625000002,
+   "r16": 2.0866406250000002,
+   "r32": 2.1354687500000002,
+   "r64": 2.2331250000000002
+  },
+  "total_gb": 10.1950158644375,
+  "kv_gb": 3.254779904,
+  "fp16_baseline_gb": 71.179869184
+ },
+ "S2": {
+  "1024": {
+   "relp": 0.08057424293506624,
+   "dH": -0.1684512753557063,
+   "hit_iid": 1.0,
+   "c_star": 0.640625
+  },
+  "32768": {
+   "relp": 0.028340740799982923,
+   "dH": -0.24689588603767376,
+   "hit_iid": 1.0,
+   "c_star": 0.625
+  },
+  "262144": {
+   "relp": 0.009336544619255658,
+   "dH": -0.24340974067395962,
+   "hit_iid": 1.0,
+   "c_star": 0.640625
+  }
+ },
+ "S3_S5": {
+  "gdn_T_dependent": false,
+  "partial_rope": 0.25,
+  "stationary_kv": true
+ },
+ "verdict": {
+  "budget_ok": true,
+  "full_ctx_structurally_supported": true,
+  "ptq_only_97": false,
+  "with_minimal_qat_plausible": true
+ }
+}

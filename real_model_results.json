@@ -1,0 +1,194 @@
+[
+  {
+    "layer": 0,
+    "kind": "attn_k",
+    "side": "rows",
+    "d_rot": 512,
+    "per_head": true,
+    "shape": [
+      512,
+      5120
+    ],
+    "identity": 0.5028845473939674,
+    "hadamard": 0.45410410479944724,
+    "rotor_rand": 0.4561252804756541,
+    "rotor_calibrated": 0.43891383289154706,
+    "secs": 1.7
+  },
+  {
+    "layer": 0,
+    "kind": "attn_v",
+    "side": "rows",
+    "d_rot": 512,
+    "per_head": true,
+    "shape": [
+      512,
+      5120
+    ],
+    "identity": 0.5575589640691231,
+    "hadamard": 0.4536334950763229,
+    "rotor_rand": 0.4560224684058968,
+    "rotor_calibrated": 0.45078724212763077,
+    "secs": 1.7
+  },
+  {
+    "layer": 0,
+    "kind": "attn_output",
+    "side": "cols",
+    "d_rot": 5120,
+    "per_head": false,
+    "shape": [
+      5120,
+      5120
+    ],
+    "identity": 0.5243637067844714,
+    "hadamard": 0.45614067509028633,
+    "rotor_rand": 0.46108706981724107,
+    "rotor_calibrated": 0.4580273903456872,
+    "secs": 43.0
+  },
+  {
+    "layer": 2,
+    "kind": "attn_k",
+    "side": "rows",
+    "d_rot": 512,
+    "per_head": true,
+    "shape": [
+      512,
+      5120
+    ],
+    "identity": 0.47406257251398093,
+    "hadamard": 0.4561490794765881,
+    "rotor_rand": 0.45579236607715284,
+    "rotor_calibrated": 0.44784186541150195,
+    "secs": 1.7
+  },
+  {
+    "layer": 2,
+    "kind": "attn_v",
+    "side": "rows",
+    "d_rot": 512,
+    "per_head": true,
+    "shape": [
+      512,
+      5120
+    ],
+    "identity": 0.49193634516991724,
+    "hadamard": 0.4545744007690537,
+    "rotor_rand": 0.45565662104559923,
+    "rotor_calibrated": 0.45088913808383757,
+    "secs": 1.7
+  },
+  {
+    "layer": 2,
+    "kind": "attn_output",
+    "side": "cols",
+    "d_rot": 5120,
+    "per_head": false,
+    "shape": [
+      5120,
+      5120
+    ],
+    "identity": 0.4656922539966572,
+    "hadamard": 0.45504940899361185,
+    "rotor_rand": 0.45725309626706284,
+    "rotor_calibrated": 0.456183375542303,
+    "secs": 42.7
+  },
+  {
+    "layer": 3,
+    "kind": "attn_k",
+    "side": "rows",
+    "d_rot": 512,
+    "per_head": true,
+    "shape": [
+      512,
+      5120
+    ],
+    "identity": 0.4955901052404032,
+    "hadamard": 0.45413179700196504,
+    "rotor_rand": 0.45499880165315537,
+    "rotor_calibrated": 0.4495617901551828,
+    "secs": 1.7
+  },
+  {
+    "layer": 3,
+    "kind": "attn_v",
+    "side": "rows",
+    "d_rot": 512,
+    "per_head": true,
+    "shape": [
+      512,
+      5120
+    ],
+    "identity": 0.461836110107188,
+    "hadamard": 0.45517119442042003,
+    "rotor_rand": 0.4546316120301591,
+    "rotor_calibrated": 0.450663248951403,
+    "secs": 1.7
+  },
+  {
+    "layer": 3,
+    "kind": "attn_output",
+    "side": "cols",
+    "d_rot": 5120,
+    "per_head": false,
+    "shape": [
+      5120,
+      5120
+    ],
+    "identity": 0.4608063053844099,
+    "hadamard": 0.45493030872879486,
+    "rotor_rand": 0.4567895417505432,
+    "rotor_calibrated": 0.45581020757596524,
+    "secs": 42.7
+  },
+  {
+    "layer": 5,
+    "kind": "attn_k",
+    "side": "rows",
+    "d_rot": 512,
+    "per_head": true,
+    "shape": [
+      512,
+      5120
+    ],
+    "identity": 0.5031127062787214,
+    "hadamard": 0.4544297431407446,
+    "rotor_rand": 0.45582654249437105,
+    "rotor_calibrated": 0.44987129756407856,
+    "secs": 1.7
+  },
+  {
+    "layer": 5,
+    "kind": "attn_v",
+    "side": "rows",
+    "d_rot": 512,
+    "per_head": true,
+    "shape": [
+      512,
+      5120
+    ],
+    "identity": 0.4399873388808243,
+    "hadamard": 0.4557816414524229,
+    "rotor_rand": 0.45548342431189975,
+    "rotor_calibrated": 0.45048348420346257,
+    "secs": 1.7
+  },
+  {
+    "layer": 5,
+    "kind": "attn_output",
+    "side": "cols",
+    "d_rot": 5120,
+    "per_head": false,
+    "shape": [
+      5120,
+      5120
+    ],
+    "identity": 0.44112482863567715,
+    "hadamard": 0.45513235192132667,
+    "rotor_rand": 0.459235184653346,
+    "rotor_calibrated": 0.4558412655244357,
+    "secs": 42.6
+  }
+]

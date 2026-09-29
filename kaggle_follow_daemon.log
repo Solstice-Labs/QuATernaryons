@@ -1,0 +1,9 @@
+following solsticeaiofficial/qtern-smol -> /Users/shreyangondaliya/research/kaggle_live.log (poll 3.0s); Ctrl-C to stop
+[15:59:47] (TimeoutError)
+following solsticeaiofficial/qtern-smol -> /Users/shreyangondaliya/research/kaggle_live.log (poll 3.0s)
+[16:02:12] +17012ch (17012 total) | === PHASE5_UNIFORM ===
+following solsticeaiofficial/qtern-smol -> /Users/shreyangondaliya/research/kaggle_live.log (poll 3.0s)
+[16:10:38] +17012ch (17012 total) | === PHASE5_UNIFORM ===
+bash: setsid: command not found
+following solsticeaiofficial/qtern-smol -> research/kaggle_live.log (poll 3.0s)
+[20:38:58] +5793ch (5793 total) | === PHASE1_CALIB ===

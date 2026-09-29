@@ -1,0 +1,18 @@
+[
+  {
+    "layer": 0,
+    "kind": "attn_output",
+    "side": "cols",
+    "d_rot": 5120,
+    "per_head": false,
+    "shape": [
+      5120,
+      5120
+    ],
+    "identity": 0.5243637067844714,
+    "hadamard": 0.45614067509028633,
+    "rotor_rand": 0.46049623401087025,
+    "rotor_calibrated": 0.4589264491000074,
+    "secs": 29.7
+  }
+]

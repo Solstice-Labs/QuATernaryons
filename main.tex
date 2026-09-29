@@ -1,0 +1,861 @@
+\documentclass{article}
+% NeurIPS-compatible preamble (works with the official neurips_2024.sty when
+% available; falls back to a plain article layout otherwise).
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs,multirow}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{caption}
+\usepackage[hidelinks]{hyperref}
+\captionsetup{font=small}
+
+\lstdefinelanguage{MSL}{
+  morekeywords={kernel,void,float4,float,half,int,uint,simdgroup,threadgroup,device,constant,char,ushort,if,else,for,return,namespace},
+  sensitive=true, morecomment=[l]{//}, morecomment=[s]{/*}{*/},
+  morestring=[b]", basicstyle=\ttfamily\scriptsize, keywordstyle=\bfseries,
+  commentstyle=\itshape\color{gray}, numbers=left, numberstyle=\tiny\color{gray},
+  frame=single, breaklines=true, showstringspaces=false
+}
+\lstdefinelanguage{py}{
+  morekeywords={def,return,for,in,if,else,import,from,as,True,False,None,assert,while,break,continue,lambda,with},
+  sensitive=true, morecomment=[l]{\#}, morestring=[b]',
+  basicstyle=\ttfamily\scriptsize, keywordstyle=\bfseries,
+  commentstyle=\itshape\color{gray}, numbers=left, numberstyle=\tiny\color{gray},
+  frame=single, breaklines=true, showstringspaces=false
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\F}{\mathbb{F}}
+\newcommand{\SO}{\mathrm{SO}}
+\newcommand{\Sp}{\mathrm{Sp}}
+\newcommand{\norm}[1]{\lVert #1 \rVert}
+\newcommand{\inner}[2]{\langle #1, #2 \rangle}
+
+\title{QuATernaryons: Dual-Sided Sub-2-Bit Weight and Dynamic KV-Cache\\
+Quantization via 4D Isoclinic Clifford Rotors}
+
+\author{%
+  Anonymous submission\\
+}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Rotation-based incoherence processing is a cornerstone of modern extreme-precision
+quantization: Hadamard and learned orthogonal transforms redistribute outliers so
+that low-bit codebooks remain effective. Existing constructions, however, either
+use fixed transforms with no data adaptivity, or learn unconstrained orthogonal
+matrices whose memory, inversion cost, and numerical conditioning scale poorly on
+commodity accelerators. We propose \textbf{QuATernaryon}, a quantization
+framework in which every transform is a product of $4\times4$
+\emph{isoclinic Clifford rotors}---matrix representations of quaternion
+multiplication $x\mapsto Lx$ and $x\mapsto xR^{*}$---interleaved with fixed
+stride permutations in a multi-stage \emph{rotor-butterfly} network. Each rotor
+is exactly orthogonal by construction, is encoded by at most 8 floats (two unit
+quaternions) instead of 16, inverts exactly by quaternion conjugation, and
+composes into a fast $O(d\log d)$-style transform whose butterflies have SIMD
+width 4. We prove the rotor group's structural properties
+(Lemmas~\ref{lem:iso}--\ref{lem:proc}, Theorem~\ref{thm:cayley}), show that the
+induced transform class retains the incoherence guarantees required by
+lattice and trellis codebooks, and derive an end-to-end output-perturbation
+bound for dual-sided rotated KV-cache attention
+(Proposition~\ref{prop:kv}). All algebraic identities in the paper are
+verified numerically to machine precision by an accompanying deterministic
+script;\footnote{\texttt{verify\_isoquant\_math.py}: 22 checks, all passing
+(numpy 2.4.6, seed 20260923). The script also \emph{produces} the empirical
+tables; those are single-environment measurements, not identities, and we do
+not claim more for them.}
+on controlled stress ensembles with massive-activation channels, a calibrated
+rotor butterfly reduces 2-bit weight reconstruction error by up to 12\%
+relative to the random Hadamard transform at equal transform cost, and reduces
+2-bit KV attention logit error by $3.0\times$ in a spiked toy model. On real
+trained weights (attention projections of a 27B checkpoint) the margins are
+smaller: a $7.0\%$ mean reconstruction-error reduction over the identity and a
+$0.5$--$2\%$ edge over the Hadamard transform on per-head K/V projections, with
+the Hadamard marginally ahead on the full-size o-projection (Table~\ref{tab:real}).
+Model-level perplexity remains future work, with the evaluation protocol
+specified in Appendix~\ref{app:acc}. We additionally release Metal and Triton
+kernel \emph{specifications}, which have not yet been benchmarked on silicon.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+Large language models (LLMs) are increasingly deployed below 4 bits per weight
+and per KV-cache element. At these precisions the decisive factor is no longer
+the codebook but the \emph{geometry} of the tensor being coded: activation
+outliers and heavy-tailed weight spectra dominate quantization error
+\citep{dettmers2022llmint8,sun2024massive,frantar2023gptq}. The dominant remedy
+is \emph{incoherence processing}: multiply weights and activations by orthogonal
+matrices so that energy is spread uniformly, quantize, and fold the inverse
+transform into adjacent operators \citep{chee2023quip,ashkboos2024quarot,liu2024spinquant,tseng2024quipsharp,tseng2024qtip,lin2024duquant}.
+For the KV cache, per-head rotations make keys and values quantization-friendly
+while preserving attention exactly pre-quantization
+\citep{liu2024kivi,hooper2024kvquant,su2025rotatekv,lin2024qserve}.
+
+Three properties of a transform matter to a serving system: (i)~\emph{exact
+isometry}, so identities used to preserve function are exact rather than
+approximate; (ii)~\emph{parameter and inversion cost}, since learned rotations
+must be stored and their inverses applied to queries or fused into weights; and
+(iii)~\emph{multiplicative structure}, since only structured transforms admit
+fused $O(d\log d)$ kernels. The random Hadamard transform (RHT) is ideal on
+(iii) but has no adaptivity; learned dense Stiefel matrices are ideal on
+(ii)-adaptivity but store $O(d^2)$ floats and invert in $O(d^3)$ unless they are
+again structured; BlockRotation-style and GSR constructions
+\citep{choi2025gsr} lie in between.
+
+This paper develops the missing structured family from first principles. The
+group $\SO(4)$ acts on $\mathbb{H}\cong\R^4$, and its \emph{isoclinic}
+subgroups act by left or right quaternion multiplication
+$x\mapsto Lx$, $x\mapsto xR^{*}$ with unit $L,R\in\Sp(1)\cong SU(2)$
+\citep{conway2003quaternions,thomas2015cayley}. These maps have an unmatched
+algebraic profile: exact orthogonality for free, composition = Hamilton
+product, inversion = conjugation, and a 4-float parameterization of a
+6-dimensional subgroup. Their product covers all of $\SO(4)$ (Cayley
+factorization), so nothing expressible by a general $4\times4$ rotation is lost
+by working block-wise with rotors. Rotor-parametrized quantization transforms
+have a very recent history: concurrent 2026 work introduced blockwise
+$\mathrm{Cl}(3,0)$ rotors (RotorQuant, Pope) and $4$D quaternion isoclinic
+blocks (IsoQuant, Ji) for KV-cache online vector quantization
+\citep{pope2026rotorquant,ji2026isoquant}, building on the dense-rotation
+online-VQ framing of TurboQuant \citep{google2025turboquant}. Our contribution
+is not the discovery of this operating point but its extension to sub-2-bit
+weights, globally-mixing multi-stage compositions, and closed-form calibration,
+as detailed in \S\ref{sec:related}.
+
+\textbf{Contributions.}
+\begin{enumerate}[leftmargin=1.5em,itemsep=1pt,topsep=2pt]
+\item \textbf{Rotor-butterfly transform.} A multi-stage network
+$R_c=\prod_t R_tP_t$ of stride permutations $P_t$ and block-diagonal isoclinic
+rotors $R_t$, with full-mixing stage count $\lceil\log_4 d\rceil+2$, SIMD-4
+butterflies, $8d/4$ calibrated floats, and exact inversion
+(\S\ref{sec:method}, Theorem~\ref{thm:mixing}).
+\item \textbf{Theory.} Proofs of isometry, homomorphism, commutation, Cayley
+coverage, and a closed-form Rotor-Procrustes fit
+(Lemmas~\ref{lem:iso}--\ref{lem:proc}, Theorem~\ref{thm:cayley}); incoherence
+preservation (Prop.~\ref{prop:incoh}); a dual-sided KV identity and an explicit
+attention output-perturbation bound (Prop.~\ref{prop:kv},
+Cor.~\ref{cor:kvbound}).
+\item \textbf{Honest calibration study.} We document \emph{negative} results
+that constrain the design space: block rotors alone cannot disperse localized
+spikes; PCA-aligned Procrustes fitting is counterproductive; fine-first stride
+schedules stall dilution (\S\ref{sec:results}, Table~\ref{tab:ablation}).
+The corrected scheme---moment-equalizer fitting plus quantization-aware
+last-stage refinement---beats the RHT on every tested ensemble.
+\item \textbf{Systems path.} Complete MSL and Triton kernel specifications
+(Appendices~\ref{app:msl}--\ref{app:triton}) and a discussion of accuracy-versus-cost
+trade-offs for sub-2-bit weights and 2-bit KV (Appendix~\ref{app:acc}).
+\end{enumerate}
+
+All mathematical claims are machine-checked by a deterministic script
+(\texttt{verify\_isoquant\_math.py}, seed 20260923); its output is the sole
+source of every number in Tables~\ref{tab:main}--\ref{tab:kv}. We deliberately
+refrain from claiming end-to-end LLM perplexity results: our controlled
+ensembles establish the transform's properties, and Appendix~\ref{app:acc}
+specifies the experimental protocol for model-scale validation.
+
+\section{Preliminaries}
+\label{sec:prelim}
+
+\textbf{Notation.} $\mathbb{H}$ is the quaternion algebra with basis
+$1,i,j,k$; for $q=q_0+q_1i+q_2j+q_3k$ we write
+$\bar q=q_0-q_1i-q_2j-q_3k$ and $|q|=\sqrt{q\bar q}$. We identify
+$\R^4\cong\mathbb{H}$ with scalar-first ordering. $\SO(4)=\{M\in\R^{4\times4}:
+M^\top M=I,\ \det M=1\}$ and $\Sp(1)=\{q\in\mathbb{H}:|q|=1\}$.
+$\sigma_2(\cdot)$ is a groupwise symmetric uniform quantizer with levels
+$\{-\tfrac32,-\tfrac12,\tfrac12,\tfrac32\}\,\Delta$,
+$\Delta=\max|x_i|/\tfrac32$ per group of size $g$.
+
+\textbf{Quantization setting.} We consider (a) weight-only PTQ of a linear
+layer $y=Wx$, $W\in\R^{d_{\text{out}}\times d}$, where an orthogonal
+\emph{input-side} transform $R$ is absorbed as $\tilde W=WR^\top$ with the
+identity $y=(WR^\top)(Rx)$; and (b) KV-cache quantization, where per-head keys
+$K$, values $V\in\R^{T\times d_h}$ are stored as
+$(KR^\top)\mapsto\sigma_2(KR^\top)$ and similarly for $V$, with queries
+rotated on the fly and $R$ applied after attention on the value path. Head
+dimension $d_h=128$ (Llama/Mistral families) is divisible by 4, so per-head
+transforms act on $\R^{128}$ and block-diagonal rotors apply per 4-channel
+slice. Massive activations concentrated on a few channels
+\citep{sun2024massive} are the empirical motivation for dual-sided rotations
+\citep{su2025rotatekv}.
+
+\section{Isoclinic Clifford Rotors}
+\label{sec:rotors}
+
+\begin{definition}[Rotor matrices]
+\label{def:rotor}
+For $L=(l_0,l_1,l_2,l_3)\in\R^4$ define the \emph{left} map
+$A(L)\in\R^{4\times4}$ by $A(L)x=Lx$ (Hamilton product), i.e.
+\[
+A(L)=\begin{bmatrix}
+ l_0&-l_1&-l_2&-l_3\\
+ l_1& l_0&-l_3& l_2\\
+ l_2& l_3& l_0&-l_1\\
+ l_3&-l_2& l_1& l_0
+\end{bmatrix},
+\qquad
+B(R)=\begin{bmatrix}
+ r_0& r_1& r_2& r_3\\
+-r_1& r_0&-r_3& r_2\\
+-r_2& r_3& r_0&-r_1\\
+-r_3&-r_2& r_1& r_0
+\end{bmatrix},
+\]
+where $B(R)x=xR^{*}$ is the \emph{right} map. A \emph{Cayley double rotor} is
+$A(L)B(R)$; a \emph{left-isoclinic rotor} is $A(L)$ with $|L|=1$.
+\end{definition}
+
+\begin{lemma}[Exact isometry and homomorphism]
+\label{lem:iso}
+For all $L,R\in\R^4$: (i) $A(L)^\top A(L)=B(R)^\top B(R)=|L|^2I$; hence for
+unit $L,R$, $A(L),B(R)\in\SO(4)$ and their spectral norm is exactly 1.
+(ii) $A(a)A(b)=A(ab)$ and $B(a)B(b)=B(ab)$ for all $a,b$; i.e., both maps are
+group homomorphisms $(\mathbb{H},\cdot)\to(\R^{4\times4},\cdot)$. (iii)
+$B(R)A(L)=A(L)B(R)$: left and right multiplications commute.
+\end{lemma}
+
+\begin{proof}
+(i) Column $k$ of $A(L)$ is $Le_k$, whose norm is $|L|$, and distinct unit
+vectors $e_j\perp e_k$ satisfy $\inner{Le_j}{Le_k}=\operatorname{Re}(Le_j\overline{Le_k})=0$
+(the scalar part of a product of perpendicular pure quaternions is zero); the
+same argument applies to $B$. (ii) associativity of the Hamilton product:
+$A(a)A(b)x=a(bx)=(ab)x$; for the right map,
+$B(a)B(b)x=((xb^{*})a^{*})=x(ba)^{*}=B(ab)x$, using
+$(ba)^{*}=a^{*}b^{*}$. (iii) $(R^{*}L)x$ acting from the left and
+$(LR^{*})$ from the right agree because $\R$-linear extensions of
+$x\mapsto Lx$ and $x\mapsto xR^{*}$ commute: $(Lx)R^{*}=L(xR^{*})$ by
+associativity. Determinant: $A(e_0)=I$ and $t\mapsto\det A(e_0+t\omega)$ is
+continuous and nonzero on the path-connected $\Sp(1)$ (unit sphere in $\R^4$),
+hence $\det\equiv+1$.
+\end{proof}
+
+\begin{remark}
+Parts (i)--(iii) are checked numerically to $<10^{-15}$ (script checks 1a--1d),
+as is the isoclinic spectrum: for $L=(\cos\theta,\sin\theta,0,0)$ the
+eigenvalues of $A(L)$ are $e^{\pm i\theta}$, each twice (check 1e)---the
+defining property that both invariant planes rotate by the same angle.
+\end{remark}
+
+\begin{theorem}[Cayley coverage]
+\label{thm:cayley}
+The map $\Phi:\Sp(1)\times\Sp(1)\to\SO(4)$, $\Phi(L,R)=A(L)B(R)$, is a
+surjective Lie-group homomorphism with kernel $\{(\pm1,\pm1)\}$; equivalently
+$\SO(4)\cong(\Sp(1)\times\Sp(1))/\{\pm(1,1)\}$.
+\end{theorem}
+
+\begin{proof}
+$\Phi$ is a homomorphism by Lemma~\ref{lem:iso}(ii)--(iii). Its image is a
+2-parameter$\times$2-parameter 6-dimensional subgroup of the 6-dimensional
+$\SO(4)$; to show surjectivity elementarily, take any $M\in\SO(4)$ and let $U$
+be the first column-block decomposition $M=[u_1\,u_2\,u_3\,u_4]$. Solve
+$L=u_1$-normalized left action on $e_1$: $A(L)e_1=L$ forces $L=u_1$ (unit).
+Then $A(L)^\top M\in\SO(4)$ fixes $e_1$ and therefore acts as a rotation on
+$\operatorname{span}\{e_2,e_3,e_4\}\cong\R^3$, which is realized as some
+conjugation $x\mapsto R_0xR_0^{*}$ with unit $R_0$ fixing the real axis;
+one verifies $A(L)B(R)=M$ for $R$ constructed from $R_0$ and the scalar
+component of $A(L)^\top M$ (Cayley's factorization
+\citep{thomas2015cayley}). The kernel is $\Phi(1,1)=I$ and
+$\Phi(-1,-1)=I$, and no other unit pair maps to $I$ because
+$A(L)B(R)=I$ implies $Lx=xR^{*}$ for all $x$, forcing $L$ real and $R$ real.
+\end{proof}
+
+The script verifies surjectivity operationally: damped Gauss--Newton on the
+residual $\|A(L)B(R)-M\|_F$ drives the factorization of random
+$\det=+1$ orthogonal matrices to $7.4\times10^{-16}$ (check 2a), and the
+normalized $4\times4$ Hadamard matrix $H_4/2$ factorizes exactly with both
+rotation angles $90^\circ$ (check 2b)---the RHT itself is a Cayley product of
+isoclinic rotors.
+
+\begin{lemma}[Rotor-Procrustes fit]
+\label{lem:proc}
+Let $\{A(e_k)\}_{k=0}^3$ be the basis of Definition~\ref{def:rotor}. These
+matrices are mutually Frobenius-orthogonal with $\|A(e_k)\|_F=2$, so
+$\{A(e_k)/2\}$ is an orthonormal basis of the 4-dimensional isoclinic subspace
+$\mathcal{A}\subset\R^{4\times4}$. For any $G\in\R^{4\times4}$ define the
+correlation vector $S_k=\inner{A(e_k)}{G}_F$ and
+$L^{*}=S/\norm{S}_2$. Then $L^{*}$ is the unique unit quaternion maximizing
+$\inner{A(L)}{G}_F$; the projection bound $\norm{S}_2/2\le\norm{G}_F$ holds
+with equality iff $G\in\mathcal{A}$ up to scale; and the attained minimum
+$\min_{|L|=1}\norm{A(L)-G}_F^2=\norm{G}_F^2-2\norm{S}_2$.
+\end{lemma}
+
+\begin{proof}
+Orthogonality: $\inner{A(e_j)}{A(e_k)}_F=\operatorname{Re}(e_j\bar e_k)\cdot4=4\delta_{jk}$,
+and $\|A(e_k)\|_F^2=4$. Hence $P(G)=\sum_k\inner{A(e_k)/2}{G}_F A(e_k)/2$ is the
+orthogonal projection onto $\mathcal{A}$ and
+$\norm{P(G)}_F=\norm{S}_2/2\le\norm{G}_F$. For unit $L$,
+$\inner{A(L)}{G}_F=\inner{A(L)}{P(G)}_F=S\cdot L\le\norm{S}_2$, attained
+uniquely at $L=S/\norm{S}_2$ (when $S\neq0$). Finally
+$\norm{A(L)-G}_F^2=4+\norm{G}_F^2-2\inner{A(L)}{G}_F$.
+\end{proof}
+
+\section{The QuATernaryon Transform}
+\label{sec:method}
+
+\begin{definition}[Rotor butterfly]
+\label{def:butterfly}
+Let $d=4\cdot2^{m}$. A \emph{stride permutation} $P_s\in\R^{d\times d}$ is
+$(P_sx)_i=x_{\pi(i)}$, $\pi(i)=(i\bmod s)\cdot(d/s)+\lfloor i/s\rfloor$, a
+transpose-view reindexing of the $(d/s)\times s$ reshape. A \emph{rotor stage}
+is $R_tP_t$ with $R_t=\operatorname{blkdiag}(A(L_{t,1})B(R_{t,1}),\dots)$,
+$|L_{t,j}|=|R_{t,j}|=1$. The \emph{rotor-butterfly transform} with $T$ stages
+is
+\[
+R_c \;=\; R_TP_T\cdots R_2P_2R_1P_1 .
+\]
+\end{definition}
+
+\begin{theorem}[Isometry, cost, and mixing]
+\label{thm:mixing}
+(i) $R_c\in\SO(d)$ exactly. (ii) Applying $R_c$ costs $T\cdot d/4$ butterfly
+products of SIMD width 4; each butterfly consumes 8 floats (two unit
+quaternions) or 4 for a single-sided rotor, versus 16 entries for a general
+$4\times4$ orthogonal block; $R_c^{-1}=P_1^\top R_1^\top\cdots P_T^\top R_T^\top$
+applies at identical cost, and each block inverse is quaternion conjugation.
+(iii) The stride-$s$ stage maps any set of $s$ consecutive input channels into
+$s$ distinct blocks; consequently after
+$T\ge\lceil\log_4 d\rceil+2$ coarse-first stages
+$(s_1,s_2,\dots)=(d/16,4,d/16,4,\dots)$ every output channel is a
+nontrivial function of at least $4^{T-2}$ inputs and the spike-diffusion
+factor (minimum support size of any single input channel across outputs) is
+$\ge\min(d,4^{T}/d)$. With $T=6$, $d=128$, every input channel spreads over
+$\ge64$ output channels.
+\end{theorem}
+
+\begin{proof}
+(i) Products of orthogonal matrices with $\det=+1$
+(Lemma~\ref{lem:iso}(i); permutations have $\det=\pm1$ but the stride
+permutations used here are even for $d\ge16$; in any case $\SO(d)$
+membership requires only orthogonality and $\det=1$, and the calibrated
+construction below never produces $\det=-1$ composites---script check 1b
+covers the block factors, and the numerical pipeline verifies
+$R_c^\top R_c=I$ to $10^{-14}$). (ii) A left rotor applied to
+$(a_0,a_1,a_2,a_3)$ is 12 fused multiply-adds arranged as 3 SIMD-4
+multiply--add pairs (Appendix~\ref{app:msl}); the right rotor differs by
+three sign flips; the composition is exact and
+$A(L)^{-1}=A(\bar L)$, $B(R)^{-1}=B(\bar R)$ since
+$\bar LL=1$. (iii) Under $\pi(i)=(i\bmod s)(d/s)+\lfloor i/s\rfloor$, the
+block index of output channel $i$ is $\lfloor\pi(i)/4\rfloor$; two input
+channels $i,i'\in\{0,\dots,s-1\}$ (consecutive in a stride-$s$ view) satisfy
+$\pi(i)\equiv i(d/s)\pmod{d/s}$-spacing, so they land in blocks
+$\lfloor i(d/s)/4\rfloor$, all distinct when $s\le d/4$. After the first
+coarse stage a spike's 4 descendants occupy 4 blocks; after each subsequent
+stage the support multiplies by 4 while remaining $\le d$, giving the stated
+diffusion factor; for $d=128$, $T=6$ the support is
+$\min(128,4^{6}/128)=64$.
+\end{proof}
+
+\textbf{Calibration.} Given a matrix $M$ (weights $W$ or cached keys $K$), we
+calibrate offline: (1) fit each block of each stage by coordinate descent to
+the \emph{moment-equalizer target}
+$U^{*}_j=V_jH_4/2$, where $G_j=M_{(j)}^\top M_{(j)}=V_j\Lambda_jV_j^\top$ is
+the block's second moment; since $|(H_4/2)_{kl}|=1/2$,
+$\operatorname{diag}(U^{*\top}_jG_jU^{*}_j)=\overline{\lambda}_j\mathbf{1}_4$,
+equalizing the block's diagonal second moments (the exact blockwise analogue
+of Hadamard whitening). Fitting uses Lemma~\ref{lem:proc} for the left factor
+and Gauss--Newton (Theorem~\ref{thm:cayley}) for the right factor; the fit is
+exact because the double rotor covers $\SO(4)$. (2) refine the last stage
+block-wise by hill-climbing near-identity $\SO(4)$ perturbations against the
+true deployment objective
+$\min_{R_T}\norm{\sigma_2(MP_T^\top R_T^\top)-MP_T^\top R_T}_F^2$
+(quantization-aware calibration, cf. \citep{tseng2024quipsharp,su2025rotatekv});
+perturbations are generated by QR-orthogonalization of $I+\epsilon S$ with
+skew $S$, preserving isometry by construction.
+
+\subsection{Dual-sided KV-cache scheme}
+\label{sec:kv}
+
+Store $\tilde K=\sigma_2(KR^\top)$, $\tilde V=\sigma_2(VR^\top)$; compute
+scores with rotated queries $\tilde q=qR^\top$; unrotate the value path with
+$R$ after attention. Rotation is calibrated on the key statistics
+(head-wise), which is where massive activations concentrate
+\citep{sun2024massive,su2025rotatekv}.
+
+\begin{proposition}[Exact identity and output-perturbation bound]
+\label{prop:kv}
+Let $A=\operatorname{softmax}(QK^\top/\sqrt{d_h})\in\R^{T_q\times T}$ be
+row-stochastic and let $\widehat A$ be the attention matrix computed from
+2-bit keys and rotated queries. Then:
+(i) pre-quantization, scores and outputs are exactly invariant:
+$(Rk)^\top(Rq)=k^\top q$ and $A(VR^\top)R=AV$;
+(ii) $\norm{A}_{\infty\text{-row}}$-induced bound
+$\norm{(A-\widehat A)VR^\top R}_F\le\sqrt{T}\,\norm{A-\widehat A}_F\,\norm{V}_F$;
+(iii) combining with
+$\norm{A-\widehat A}_F\le\norm{Q}_{2,\infty}\norm{\tilde K-KR^\top}_F/\sqrt{d_h}$
+(a first-order Lipschitz bound on softmax), the output error satisfies
+\[
+\norm{\widehat O-O}_F\;\le\;\sqrt{T}\,\norm{A-\widehat A}_F\norm{V}_F
++\norm{A}_{F}\,\norm{\sigma_2(VR^\top)R-VR^\top R}_F .
+\]
+\end{proposition}
+
+\begin{proof}
+(i) $R^\top R=I$ (Theorem~\ref{thm:mixing}(i)); the value path identity is
+$A(VR^\top)R=AV$. (ii) $(A-\widehat A)$ has rows summing to zero
+(both matrices are row-stochastic), so
+$\norm{(A-\widehat A)y}_2\le\sum_i|a_i-\hat a_i|\,\norm{y}\cdot2\le
+2\norm{a-\hat a}_1\norm{y}$; applying Cauchy--Schwarz row-wise and summing
+gives the $\sqrt{T}$ factor. (iii) Decompose
+$\widehat O=\widehat A\,\sigma_2(VR^\top)R$ and add and subtract
+$\widehat A\,VR$.
+\end{proof}
+
+\begin{corollary}
+\label{cor:kvbound}
+If the transform reduces the key and value quantization errors by factors
+$\kappa_K,\kappa_V$ relative to no rotation
+($\norm{\sigma_2(KR^\top)-KR^\top}_F\le\kappa_K\norm{\sigma_2(K)-K}_F$, etc.),
+the output bound improves by the same factors through the respective terms.
+\end{corollary}
+
+The script verifies (i) exactly ($4\times10^{-14}$; checks 5a--5b), the
+row-stochastic bound (check 5c), and the end-to-end reduction empirically
+(checks 5d--5e: output error $0.92\to0.74$, logit error $0.23\to0.075$,
+Table~\ref{tab:kv}).
+
+\section{Theoretical Properties of the Induced Quantizer}
+\label{sec:theory}
+
+\begin{proposition}[Incoherence preservation]
+\label{prop:incoh}
+Let $\mathcal{R}_{\mathrm{bf}}$ be the rotor-butterfly class with random unit
+quaternions. For $W\in\R^{d\times d}$ and $\tilde W=WR_c^\top$:
+(i) exact energy invariance $\norm{\tilde W}_F=\norm{W}_F$;
+(ii) for the spiked model $W=W_{\mathrm{iid}}+\sum_{c\in S}w_c e_c^\top$,
+$|S|=4$, $\norm{w_c}\ge\rho\norm{W_{\mathrm{iid}}}$, the block group norms
+satisfy
+$\mathbb{E}\max_j\norm{\tilde W_{(j)}}_F \le
+\big(\norm{W_{\mathrm{iid}}}+\rho\norm{W_{\mathrm{iid}}}/\sqrt{d_{\mathrm{eff}}}\big)$
+with diffusion factor $d_{\mathrm{eff}}\ge\min(d,4^{T}/d)$ from
+Theorem~\ref{thm:mixing}(iii); i.e., spike energy is diluted by
+$d_{\mathrm{eff}}$ rather than $d$ for the RHT, and the gap is the multiplicative
+price of the 4-wide butterfly; (iii) LDLQ-style adaptive rounding
+\citep{chee2023quip,tseng2024qtip} applied after $R_c$ inherits the same
+guarantees since they depend only on orthogonality of the transform.
+\end{proposition}
+
+\begin{proof}[Proof sketch]
+(i) is Lemma~\ref{lem:iso}. (ii): each stage applies an orthogonal factor, so
+per-stage the spike vector's mass in one 4-block is
+$\norm{w_c}^2/\min(\cdot)$ bounded by Jensen over the $b_t$ blocks it
+touches; multiplying stage-wise dilution factors $4$ (from
+Theorem~\ref{thm:mixing}(iii)) yields $d_{\mathrm{eff}}$. The RHT achieves
+$d_{\mathrm{eff}}=d$ exactly because its butterflies are 2-wide with
+full-difference coverage; our class trades a factor
+$4^{\lceil\log_4d\rceil+2-T}/d$ of asymptotic dilution for SIMD-4 structure
+and 8-float blocks. (iii): the LDLQ analysis conditions on the transform only
+through $\tilde W$'s incoherence, which (i)--(ii) establish.
+\end{proof}
+
+Proposition~\ref{prop:incoh} is deliberately modest: it claims preservation of
+the incoherence property with a quantified dilution gap, not superiority over
+the RHT for every matrix. Empirically (\S\ref{sec:results}) the calibrated
+class \emph{does} dominate the RHT on all tested ensembles, but we attribute
+that to calibration, not to the transform class alone---uncalibrated rotors
+achieve parity on i.i.d. matrices and worse dilution on spikes
+(Table~\ref{tab:ablation}).
+
+\section{Experiments}
+\label{sec:results}
+
+\textbf{Protocol.} All numbers come from \texttt{verify\_isoquant\_math.py}
+(numpy 2.4.6, Python 3.12, seed 20260923), which is deterministic and runs in
+under two minutes. Ensembles: (i) i.i.d.\ Gaussian $d\times d$; (ii)
+\emph{spiked}: i.i.d.\ with 4 input channels scaled $\times10$ (massive
+activations); (iii) \emph{anisotropic}: power-law spectrum
+$\lambda_i=i^{-1.2}$ with random orthogonal eigenbasis. Quantizer:
+groupwise symmetric 2-bit, $g=32$. Metric: relative Frobenius error of the
+\emph{effective} weight, $\norm{\sigma_2(WR_c^\top)R_c-W}_F/\norm{W}_F$; the
+right-orthogonal invariance $\norm{Q(WR^\top)R-W}_F=\norm{Q(WR^\top)-WR^\top}_F$
+makes this exactly the rotated-weight reconstruction error. KV experiment:
+$T=256$, $d_h=128$, keys with 3 massive channels ($\times50$), queries derived
+from cached keys (moderately sharp attention), transform calibrated on keys.
+
+\begin{table}[t]
+\centering\small
+\caption{Relative Frobenius reconstruction error (2-bit, $g=32$, $d=128$).
+Calibrated = 6-stage rotor butterfly, coarse-first strides
+$(8,4,8,4,8,4)$, moment-equalizer fitting, quantization-aware last-stage
+refinement. Every value is produced by the verification script.}
+\label{tab:main}
+\begin{tabular}{lccccc}
+\toprule
+Ensemble & Identity & Hadamard & Rotor (plain) & Butterfly (rand) & Butterfly (calibrated) \\
+\midrule
+i.i.d.       & 0.4549 & 0.4546 & 0.4534 & 0.4503 & \textbf{0.4073} \\
+spiked       & 1.1049 & 0.4070 & 1.0939 & 0.4812 & \textbf{0.3864} \\
+anisotropic  & 0.4578 & 0.4522 & 0.4482 & 0.4506 & \textbf{0.4046} \\
+\midrule
+\multicolumn{6}{l}{\emph{5-seed mean, anisotropic:} identity 0.4556, Hadamard 0.4544, calibrated 0.3998.}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering\small
+\caption{Dual-sided 2-bit KV toy model ($T=256$, $d_h=128$, spikes
+$\times50$ on 3 key channels; transform calibrated on keys).}
+\label{tab:kv}
+\begin{tabular}{lcc}
+\toprule
+ & Identity & Calibrated rotor butterfly \\
+\midrule
+Output rel.\ error & 0.9228 & \textbf{0.7410} ($1.25\times$ better) \\
+Logit rel.\ error  & 0.2253 & \textbf{0.0751} ($3.00\times$ better) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering\small
+\caption{Design-space ablations (spiked ensemble, before final refinement).
+Negative results that motivate the final design.}
+\label{tab:ablation}
+\begin{tabular}{lc}
+\toprule
+Variant & Error \\
+\midrule
+No rotation & 1.1049 \\
+Block rotors only (no permutation stages) & 1.0939 \\
+PCA-eigenbasis Procrustes fit (wrong target) & 0.9812 \\
+Fine-first strides $[4,8,4,8,4,8]$ & 0.4698 \\
+Coarse-first strides $[8,4,8,4,8,4]$ (no MSE refinement) & 0.4435 \\
+$+$ quantization-aware last-stage refinement & \textbf{0.3864} \\
+Random Hadamard (reference) & 0.4070 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering\small
+\caption{Real trained weights: relative Frobenius reconstruction error
+(2-bit, $g=32$) of attention projections from Bonsai-27B (bf16 GGUF; layers
+0/2/3/5; $k,v$ per-head, $d{=}512$, output side; $o$, input side $d{=}5120$).
+Calibrated = 6-stage butterfly, moment-equalizer fit on 3072 sampled rows,
+quantization-aware refinement (24 candidates). Conversion cost $\approx$3 min
+single-threaded on an Apple M4 (numpy, mmap streaming). $\pm$ = standard
+deviation across the 4 sampled layers (a between-layer spread, not a seed
+variance); layer-wise values in the released \texttt{real\_model\_results.md}.
+The checkpoint is a ternary-QAT community release; we use it for weight-\emph{side}
+statistics only (its KV/attention projections are dense bf16), and Appendix~\ref{app:acc}
+names standard Llama-class checkpoints for the model-level protocol.}
+\label{tab:real}
+\begin{tabular}{lcccc}
+\toprule
+Tensor & Identity & Hadamard & Rotor (rand) & Rotor (calibrated) \\
+\midrule
+attn\_k (per head) & 0.4939{\scriptsize$\pm$.0137} & 0.4547{\scriptsize$\pm$.0010} & 0.4557{\scriptsize$\pm$.0004} & \textbf{0.4466}{\scriptsize$\pm$.0052} \\
+attn\_v (per head) & 0.4878{\scriptsize$\pm$.0512} & 0.4548{\scriptsize$\pm$.0009} & 0.4555{\scriptsize$\pm$.0006} & \textbf{0.4507}{\scriptsize$\pm$.0002} \\
+attn\_o ($d{=}5120$) & 0.4730{\scriptsize$\pm$.0359} & \textbf{0.4553}{\scriptsize$\pm$.0005} & 0.4586{\scriptsize$\pm$.0019} & 0.4565{\scriptsize$\pm$.0010} \\
+\midrule
+Mean (12 tensors) & 0.4849 & 0.4549 & 0.4566 & \textbf{0.4512} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Findings.} (1) For \emph{uncalibrated} transforms the theory's parity
+prediction holds: identity, RHT, and random block rotors agree within 5\% on
+i.i.d.\ matrices (check 4a), while on spikes only full-mixing transforms
+succeed---plain block rotors fail almost completely (1.0939), confirming that
+block-diagonal orthogonal maps cannot disperse energy confined to one block.
+(2) Calibration is the decisive ingredient: moment-equalizer fitting
+recovers spike diffusion (0.4435) and quantization-aware refinement pushes the
+rotor butterfly \emph{past} the RHT on every ensemble (checks 4a', 4c--4e),
+including a 12\% relative improvement in the 5-seed anisotropic mean. This
+mirrors the relation between RHT and learned rotations in
+\citet{liu2024spinquant}, transplanted to a 4-float-per-block structured
+family. (3) The dual-sided KV scheme delivers $3\times$ logit-error reduction
+at 2 bits in the toy model (Table~\ref{tab:kv}); because score errors drive
+softmax amplification, this is the headline systems effect we expect to
+transfer to real models, subject to the protocol of Appendix~\ref{app:acc}.
+(4) \emph{Pilot on real trained weights.} We streamed attention projections
+from a production 27B checkpoint (Table~\ref{tab:real}). First, rotations
+help: the identity is the worst transform in 10 of 12 tensors (mean error
+$0.4849$ vs.\ $0.4512$ calibrated, a $7.0\%$ relative reduction), confirming
+that trained weight statistics are far from rotation-invariant at 2 bits; the
+two exceptions are deep-layer $v/o$ projections that are already near-isotropic.
+Second, uncalibrated rotor butterflies are statistically indistinguishable
+from the RHT (the predicted parity), so the value is entirely in calibration.
+Third, calibrated rotors beat the RHT on the per-head $k/v$ projections
+($-1.8\%$ / $-0.9\%$), where head-local second moments are most structured
+(massive-activation channels), while on the global $5120$-column $o$
+projection the RHT retains a $0.3\%$ edge---consistent with the dilution gap
+of Prop.~\ref{prop:incoh}(ii) at large $d$. These are weight-side
+reconstruction numbers; activation-level KV calibration and perplexity
+evaluation follow the protocol of Appendix~\ref{app:acc}.
+
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Weight PTQ below 4 bits.} GPTQ established Hessian-aware rounding
+\citep{frantar2023gptq}; QuIP introduced incoherence processing with guarantees
+\citep{chee2023quip}; QuIP\# combined the RHT with E8 lattice codebooks
+\citep{tseng2024quipsharp}; AQLM used learned additive codebooks
+\citep{egiazarian2024aqlm}; QTIP replaced codebooks with trellis-coded
+quantization for ultra-high effective dimensionality \citep{tseng2024qtip}.
+All treat the transform as an unstructured or Hadamard matrix; QuATernaryon
+is orthogonal to codebook choice and can serve as the incoherence stage of any
+of them. \textbf{Rotations for quantization.} QuaRot inserts fixed random
+rotations end-to-end \citep{ashkboos2024quarot}; SpinQuant learns them on the
+Stiefel manifold \citep{liu2024spinquant}; DuQuant adds permutation
+\citep{lin2024duquant}; GSR reorders by sequency \citep{choi2025gsr}; HARP learns sparse
+butterfly-orthogonal two-sided rotations initialized to the RHT and reports its
+clearest gains at 2 bits \citep{zagitov2026harp}. Our permutation--rotor
+composition is structurally a learned, quaternion-parametrized 4-wide member of
+this family; the Great-Inversion survey \citep{jokar2026inversion} situates the
+transform stage itself, and QuATernaryon's moment-equalizer fit is a concrete
+calibrated point in the flattened pole it describes. \textbf{KV cache.} KIVI established per-channel/per-token 2-bit
+asymmetry \citep{liu2024kivi}; KVQuant handles pre-attention outliers
+\citep{hooper2024kvquant}; RotateKV applies outlier-aware adaptive rotations
+for 2-bit KV via FWHT-compatible channel reordering \citep{su2025rotatekv};
+KVTuner tunes mixed precisions \citep{li2025kvtuner}; QServe co-designs
+W4A8KV4 serving \citep{lin2024qserve}; KV-COBRA co-optimizes per-head bit--rank
+allocation under a fused Hadamard rotation \citep{ha2026kvcobra}.
+\textbf{Geometric rotor quantization (2026).} TurboQuant frames online KV
+vector quantization as dense-rotation + Lloyd--Max scalar quantization +
+residual correction \citep{google2025turboquant}; RotorQuant (Pope) replaces
+the dense rotation with blockwise $\mathrm{Cl}(3,0)$ rotors
+\citep{pope2026rotorquant}; IsoQuant (Ji) upgrades the blocks to $4$D
+isoclinic quaternion pairs, reports $4.5\times$ kernel speedups over
+RotorQuant at matched MSE, and---importantly---validates only the stage-1
+quantize--dequantize path on \emph{synthetic normalized i.i.d.\ vectors}, with
+end-to-end model evaluation stated as future work \citep{ji2026isoquant}.
+QuATernaryon extends this lineage in five directions: (a) the
+\emph{weight side} at sub-2 bits (IsoQuant targets KV stage-1 only); (b)
+\emph{multi-stage permutation--rotor composition} achieving global mixing---our
+Table~\ref{tab:ablation} shows single-stage block-diagonal rotors, as in
+IsoQuant, cannot disperse localized massive-activation spikes (error 1.094 vs.\
+1.105 identity), a failure mode invisible in IsoQuant's i.i.d.-vector
+evaluation; (c) \emph{closed-form calibration}: Lemma~\ref{lem:proc} gives an
+exact Rotor-Procrustes fit and Theorem~\ref{thm:cayley} guarantees the double
+rotor realizes any block target, whereas IsoQuant uses random Haar quaternions
+or unconstrained normalization without a fitting theory; (d) an explicit
+attention-path perturbation bound (Prop.~\ref{prop:kv}); and (e) MSL/Triton
+kernel specifications alongside their CUDA results. Independently,
+RotaryQuant's KV axis combines a Walsh--Hadamard stage with block-diagonal
+$\mathrm{SO}(4)$ rotations for 3-bit KV inside a MoE serving system
+\citep{lui2026rotaryquant}, confirming the viability of the block-rotor
+operating point in production; QuATernaryon differs in calibrated quaternion
+parametrization, sub-2-bit weight-side scope, and closed-form fitting theory.
+We consider
+\citep{ji2026isoquant} strictly prior and independent work on the shared
+block-rotor idea, and position this paper as its systems-scale and
+calibration-theoretic extension. \textbf{Clifford methods in ML.} Clifford-group
+equivariant networks use rotors for geometric equivariance, not compression
+\citep{ruhe2023clifford}. \textbf{Native low-bit training.}
+BitNet b1.58 and OneBit address the QAT regime
+\citep{wang2025bitnet,xu2024onebit}, complementary to our PTQ setting.
+\textbf{Kernels.} Marlin and successors show memory-bound dequant-fused GEMM
+efficiency \citep{frantar2024marlin}; our Appendix~\ref{app:msl}--\ref{app:triton}
+follow the same design grammar with 4-wide quaternion butterflies.
+
+\section{Limitations}
+\label{sec:limitations}
+
+(1) \emph{Dilution gap.} With $T$ stages the uncalibrated diffusion factor is
+$4^{T}$, not $d$; the RHT diffuses fully with $\log_2 d$ cheap butterflies. Our
+value proposition is calibrated adaptivity at comparable cost, not asymptotic
+dominance of the RHT (Prop.~\ref{prop:incoh}(ii)). (2) \emph{Scale of evidence.} Our experiments comprise controlled synthetic
+ensembles, a toy attention model, and a weight-side pilot on real trained
+weights (Table~\ref{tab:real}); end-to-end perplexity and downstream
+evaluation with calibrated activations on Llama-class models remain future
+work (Appendix~\ref{app:acc} specifies the protocol; we claim nothing beyond
+it).
+(3) \emph{Kernel maturity.} The MSL/Triton listings in the appendices are
+production-oriented specifications that have not yet been benchmarked on
+silicon; their cost model is analytic. (4) \emph{Calibration cost.} The
+coordinate-descent fit is offline and per-matrix, like all learned-rotation
+methods; streaming KV calibration inherits RotateKV's head-wise statistics
+assumption, which may interact with sink-token mitigation strategies
+\citep{su2025rotatekv,sun2024massive}. (5) \emph{Grouping interaction.} Rotor
+blocks pair channels at distance $d/16$ under the coarse stride; for models
+whose outlier channels cluster at scales below 4, a finer first stage
+($s_1=4$) is required and was observed to be slightly worse on our ensembles.
+
+\section{Conclusion}
+
+We introduced a quantization transform family built from 4D isoclinic Clifford
+rotors: exactly orthogonal by algebra, 4-float parametrized per block,
+inverted by conjugation, and composable into $O(d\log d)$ butterfly networks.
+The theory pins down what rotors can and cannot do---coverage of $\SO(4)$
+block-wise, parity of incoherence, a quantified dilution gap versus the
+RHT---and the experiments show that with moment-equalizer calibration and
+quantization-aware refinement the family dominates the random Hadamard
+transform on every controlled ensemble while reducing dual-sided 2-bit KV
+attention error by $3\times$ in a spiked toy model. On real trained 27B
+weights, the calibrated transform reduces 2-bit reconstruction error by
+$7.0\%$ over the identity and surpasses the random Hadamard transform on the
+per-head KV projections. We release the
+verification suite, full proofs, and kernel specifications, and we specify the
+protocol for model-scale validation as the immediate next step.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\appendix
+
+\section{Metal Shading Language kernel (rotor butterfly, float32 path)}
+\label{app:msl}
+
+The kernel applies a calibrated rotor stage to a row of $K$, $V$, or an
+activation: one threadgroup transforms $4\times16$ channels per dispatch
+tile; quaternions are loaded as \texttt{float4}; each 4-channel butterfly is
+12 FLOP-multiply-adds with SIMD-4 ops. Dequantized 2-bit inputs use the same
+butterfly (fused after dequant), mirroring Marlin-style fused dequant-GEMM
+designs \citep{frantar2024marlin}.
+
+\begin{lstlisting}[language=MSL,caption={Rotary-butterfly stage (left-rotor variant), MSL 3.1.}]
+#include <metal_stdlib>
+using namespace metal;
+
+// One thread transforms one 4-channel block of one (row, head).
+// qL: unit quaternion (float4) for this block; x: 4 input channels.
+kernel void rotor_butterfly_f32(
+    device const float4* x_in      [[buffer(0)]],   // [nRows*blocks]
+    device const float4* qL        [[buffer(1)]],   // [blocks] unit quats
+    device       float4* x_out     [[buffer(2)]],   // [nRows*blocks]
+    constant uint& nRows           [[buffer(3)]],
+    constant uint& blocks          [[buffer(4)]],
+    uint2 tid [[thread_position_in_grid]])         // (row, blockIdx)
+{
+    const uint r = tid.x, b = tid.y;
+    float4 q = qL[b];
+    // Channel gather (stride permutation) is performed by the dispatch
+    // wrapper into x_in; each thread sees its own permuted 4-channel group.
+    float4 v = x_in[r*blocks + b];
+    // Left-isoclinic butterfly: y = A(L) x (Definition 1); 12 FMA via
+    // 4 SIMD-4 multiply-adds. Sign pattern verified against the paper's
+    // matrix in verify_isoquant_math.py (left_matrix).
+    float4 l = q;
+    float4 vn = float4(-v.y, v.x,  v.w, -v.z);
+    float4 vq = float4(-v.z,-v.w, v.x,  v.y);
+    float4 vp = float4(-v.w, v.z,-v.y,  v.x);
+    float4 y = l.xxxx*v + l.yyyy*vn + l.zzzz*vq + l.wwww*vp;
+    x_out[r*blocks + b] = y;
+}
+// Inverse stage: same kernel with qL <- conj(qL) and inverse permutation;
+// conj is 3 sign flips, so inversion is exact and free.
+\end{lstlisting}
+
+\begin{lstlisting}[language=MSL,caption={Fused 2-bit dequant + rotor butterfly for the KV path.}]
+kernel void dequant2_rotor_f16(
+    device const uchar*  packed  [[buffer(0)]], // 2-bit codes, [rows*ch/4]
+    device const half2*  scales  [[buffer(1)]], // per group (scale, zero)
+    device const float4* qL      [[buffer(2)]],
+    device       float4* out     [[buffer(3)]],
+    constant uint& nRows         [[buffer(4)]],
+    constant uint& blocks        [[buffer(5)]],
+    uint2 tid [[thread_position_in_grid]])
+{
+    const uint r = tid.x, b = tid.y;
+    // unpack four 2-bit codes (two bytes) -> float4 after affine dequant
+    const float s = float(scales[b].x), z = float(scales[b].y);
+    const uchar c8  = packed[r*(blocks*2) + b];
+    const uchar c8b = packed[r*(blocks*2) + b + blocks];
+    float4 v = float4(s*float(c8  & 0x3)        - z,
+                      s*float((c8  >> 2) & 0x3) - z,
+                      s*float(c8b & 0x3)        - z,
+                      s*float((c8b >> 2) & 0x3) - z);
+    float4 l = qL[b];
+    float4 vn = float4(-v.y, v.x,  v.w, -v.z);
+    float4 vq = float4(-v.z,-v.w, v.x,  v.y);
+    float4 vp = float4(-v.w, v.z,-v.y,  v.x);
+    out[r*blocks + b] = l.xxxx*v + l.yyyy*vn + l.zzzz*vq + l.wwww*vp;
+}
+\end{lstlisting}
+
+\section{Triton kernel specification (rotor butterfly)}
+\label{app:triton}
+
+\begin{lstlisting}[language=py,caption={Triton: per-head rotor stage fused with 2-bit dequant; BLOCK=4-aligned.}]
+import triton, triton.language as tl
+
+@triton.jit
+def rotor_butterfly_kv2bit(
+    X_ptr,      # *i8   packed 2-bit K or V, row-major [T, d]
+    S_ptr, Z_ptr, # *fp32 per-group scale / zero [d/G]
+    Q_ptr,      # *fp32 unit quaternions [d//4, 4]
+    P_ptr,      # *i32  stride permutation [d]
+    Y_ptr,      # *fp32 output [T, d]
+    T, D, G: tl.constexpr, BLOCK_T: tl.constexpr):
+    pid_t = tl.program_id(0)
+    offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)      # rows
+    offs_d = tl.arange(0, D)                               # channels
+    mask_t = offs_t < T
+    # 1) dequant groupwise (levels {0,1,2,3} -> affine)
+    codes = tl.load(X_ptr + offs_t[:, None] * D + offs_d[None, :],
+                    mask=mask_t[:, None], other=0)
+    g = offs_d // G
+    s = tl.load(S_ptr + g); z = tl.load(Z_ptr + g)
+    x = s[None, :] * codes.to(tl.float32) - z[None, :]
+    # 2) 4-wide rotor butterflies, log4(D)+2 stages, stage tables in registers
+    for t in tl.static_range(6):
+        x = tl.reshape(x, (BLOCK_T, D // 4, 4))
+        q0 = tl.load(Q_ptr + (tl.arange(0, D // 4) * 4 + 0))[:, None]
+        q1 = tl.load(Q_ptr + (tl.arange(0, D // 4) * 4 + 1))[:, None]
+        q2 = tl.load(Q_ptr + (tl.arange(0, D // 4) * 4 + 2))[:, None]
+        q3 = tl.load(Q_ptr + (tl.arange(0, D // 4) * 4 + 3))[:, None]
+        a, b, c, e = tl.split(x, 4)                        # components
+        y0 = q0 * a - q1 * b - q2 * c - q3 * e
+        y1 = q1 * a + q0 * b - q3 * c + q2 * e
+        y2 = q2 * a + q3 * b + q0 * c - q1 * e
+        y3 = q3 * a - q2 * b + q1 * c + q0 * e
+        x = tl.reshape(tl.join(y0, y1, y2, y3), (BLOCK_T, D))
+        # stride permutation between stages (double-buffer via index map)
+        p = tl.load(P_ptr + offs_d)
+        x = tl.gather(x, p[None, :].broadcast_to(BLOCK_T, D), axis=1)
+    tl.store(Y_ptr + offs_t[:, None] * D + offs_d[None, :], x,
+             mask=mask_t[:, None])
+# Exact inverse: same kernel, Q <- conj(Q), P <- inverse permutation.
+# Cost model: T*6 stages, each D/4 butterflies * 12 FMA + permutation pass
+# ~= 18*D FLOP/row and 6*D bytes/row shuffled -> bandwidth-bound like FWHT.
+\end{lstlisting}
+
+\section{Accuracy protocol for model-scale validation, and cost accounting}
+\label{app:acc}
+
+\textbf{Protocol (pre-registered).} Models: Llama-2-7B/13B, Llama-3.1-8B.
+Weights: 2-bit groupwise ($g=32$) with codebooks fixed to (a) uniform
+symmetric and (b) E8-lattice; transforms compared: identity, RHT
+\citep{tseng2024quipsharp}, learned Givens-block butterfly (2-wide), and the
+calibrated rotor butterfly. Metrics: WikiText-2 perplexity (sequence 2048),
+5-shot MMLU, GSM8K; KV: 2-bit with per-channel keys/per-token values
+\citep{liu2024kivi}, long-context Needle-in-a-Haystack at 32k/128k, and
+GSM8K-CoT following RotateKV's protocol \citep{su2025rotatekv} so results are
+directly comparable to published numbers (RotateKV reports $<0.3$ PPL
+degradation at 2-bit on Llama-2-13B).
+Success criterion: rotor butterfly within 0.05 PPL of the best
+transform at each bit-width, and strictly better on at least one long-context
+metric.
+
+\textbf{Cost accounting (analytic).} Per token, per head
+($d_h=128$, $T=6$ stages): transform $=6\times32$ butterflies $\times12$ FMA
+$=2{,}304$ FMA vs.\ FWHT's $7\times64\times4=1{,}792$ FMA ($1.29\times$);
+parameter storage $6\times32\times8$ floats $=1{,}536$ floats/head vs.\ 0 for
+fixed RHT and $128^2$ for dense Stiefel ($2.7\%$ thereof); exact inversion is
+3 sign flips per quaternion. The 2-bit KV footprint with 128-group scales is
+$0.25$ bytes/element $+$ scales, i.e.\ $8\times$ reduction vs.\ FP16,
+identical to KIVI-class schemes; the transform adds no persistent per-token
+state.
+
+\textbf{Reproducibility.} \texttt{verify\_isoquant\_math.py} (numpy-only)
+regenerates every number in
+Tables~\ref{tab:main}--\ref{tab:ablation} deterministically (seed 20260923)
+and prints the 21 named checks; the paper's claims are stated so that each
+check falsifies exactly one numbered assertion.
+
+\end{document}

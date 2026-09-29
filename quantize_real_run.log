@@ -1,0 +1,4 @@
+reading /Users/shreyangondaliya/Downloads/Bonsai-27B-dspark-bf16.gguf
+selected 6 matrices across layers [0, 5]
+blk0.attn_k     d=  512 rows id 0.5029  H 0.4541  rand 0.4561  cal 0.4353 (14.9s)
+blk0.attn_v     d=  512 rows id 0.5576  H 0.4536  rand 0.4567  cal 0.4464 (15.1s)
