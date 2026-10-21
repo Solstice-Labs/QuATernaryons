@@ -63,35 +63,47 @@ def quantize_ternary_group(
 def quantize_ternary_asymmetric(
     W: torch.Tensor,
     group_size: int = 32,
-    n_search: int = 24
+    n_search: int = 12
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Asymmetric ternary quantization:
+    Fast fully-vectorized asymmetric ternary quantization:
         W ~ beta + repeat(alpha, g) * T
     Where beta is per-row mean, alpha is per-group scale, T in {-1, 0, +1}.
+    Processes all groups simultaneously across entire matrix in a single vectorized pass.
     """
     out_dim, in_dim = W.shape
     assert in_dim % group_size == 0, f"in_dim {in_dim} must be divisible by group_size {group_size}"
     n_groups = in_dim // group_size
 
-    # 1. Per-row asymmetric offset beta
-    beta = W.mean(dim=-1, keepdim=True)  # (out_dim, 1)
-    W_centered = W - beta
+    beta = W.mean(dim=-1, keepdim=True)
+    W_centered = (W - beta).view(-1, group_size)
 
-    # 2. Per-group ternary quantization
-    alphas = []
-    T_list = []
-    for g in range(n_groups):
-        g0 = g * group_size
-        g1 = g0 + group_size
-        alpha_g, T_g = quantize_ternary_group(W_centered[:, g0:g1], n_search=n_search)
-        alphas.append(alpha_g)
-        T_list.append(T_g)
+    amax = W_centered.abs().max(dim=-1, keepdim=True).values.clamp_min(1e-8)
+    W_norm = W_centered / amax
 
-    alpha = torch.cat(alphas, dim=-1)  # (out_dim, n_groups)
-    T = torch.cat(T_list, dim=-1)      # (out_dim, in_dim)
+    best_err = torch.full_like(amax, float("inf"))
+    best_T = torch.zeros_like(W_centered, dtype=torch.int8)
 
-    # 3. Base reconstruction
+    for tau_val in torch.linspace(0.40, 0.80, n_search, device=W.device):
+        T_cand = torch.clamp(torch.round(W_norm / tau_val), -1.0, 1.0)
+        num = (W_norm * T_cand).sum(dim=-1, keepdim=True)
+        den = (T_cand * T_cand).sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        alpha_cand = (num / den).clamp_min(1e-4)
+
+        recon = alpha_cand * T_cand
+        err = ((W_norm - recon) ** 2).sum(dim=-1, keepdim=True)
+
+        better = err < best_err
+        best_err = torch.where(better, err, best_err)
+        best_T = torch.where(better, T_cand.to(torch.int8), best_T)
+
+    num = (W_centered * best_T.float()).sum(dim=-1, keepdim=True)
+    den = (best_T.float() * best_T.float()).sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    alpha = (num / den).clamp_min(1e-6)
+
+    alpha = alpha.view(out_dim, n_groups)
+    T = best_T.view(out_dim, in_dim)
+
     alpha_expanded = torch.repeat_interleave(alpha, group_size, dim=-1)
     W_base = beta + alpha_expanded * T.to(W.dtype)
 
