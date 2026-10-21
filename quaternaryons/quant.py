@@ -63,10 +63,10 @@ def quantize_ternary_group(
 def quantize_ternary_asymmetric(
     W: torch.Tensor,
     group_size: int = 32,
-    n_search: int = 12
+    n_search: int = 4
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Fast fully-vectorized asymmetric ternary quantization:
+    Fast fully-vectorized asymmetric ternary quantization in native dtype:
         W ~ beta + repeat(alpha, g) * T
     Where beta is per-row mean, alpha is per-group scale, T in {-1, 0, +1}.
     Processes all groups simultaneously across entire matrix in a single vectorized pass.
@@ -84,7 +84,7 @@ def quantize_ternary_asymmetric(
     best_err = torch.full_like(amax, float("inf"))
     best_T = torch.zeros_like(W_centered, dtype=torch.int8)
 
-    for tau_val in torch.linspace(0.40, 0.80, n_search, device=W.device):
+    for tau_val in torch.linspace(0.45, 0.75, n_search, device=W.device, dtype=W.dtype):
         T_cand = torch.clamp(torch.round(W_norm / tau_val), -1.0, 1.0)
         num = (W_norm * T_cand).sum(dim=-1, keepdim=True)
         den = (T_cand * T_cand).sum(dim=-1, keepdim=True).clamp_min(1e-6)
@@ -97,8 +97,8 @@ def quantize_ternary_asymmetric(
         best_err = torch.where(better, err, best_err)
         best_T = torch.where(better, T_cand.to(torch.int8), best_T)
 
-    num = (W_centered * best_T.float()).sum(dim=-1, keepdim=True)
-    den = (best_T.float() * best_T.float()).sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    num = (W_centered * best_T.to(W.dtype)).sum(dim=-1, keepdim=True)
+    den = (best_T.to(W.dtype) * best_T.to(W.dtype)).sum(dim=-1, keepdim=True).clamp_min(1e-6)
     alpha = (num / den).clamp_min(1e-6)
 
     alpha = alpha.view(out_dim, n_groups)
