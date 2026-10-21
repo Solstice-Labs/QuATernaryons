@@ -39,13 +39,13 @@ class QuATernaryonLinear(nn.Module):
         self.rotor = QuATernaryonRotorNetwork(in_features)
 
         # Frozen integer ternary codes T in {-1, 0, +1}
-        self.register_buffer("T", torch.zeros(out_features, in_features, dtype=torch.float32))
+        self.register_buffer("T", torch.zeros(out_features, in_features, dtype=torch.int8))
 
         # Quantization parameters (continuous parameters can be trained in QAT polish)
-        alpha = torch.ones(out_features, self.n_groups, dtype=torch.float32)
-        beta = torch.zeros(out_features, 1, dtype=torch.float32)
-        U = torch.zeros(out_features, rank, dtype=torch.float32)
-        V = torch.zeros(in_features, rank, dtype=torch.float32)
+        alpha = torch.ones(out_features, self.n_groups, dtype=torch.bfloat16)
+        beta = torch.zeros(out_features, 1, dtype=torch.bfloat16)
+        U = torch.zeros(out_features, rank, dtype=torch.bfloat16)
+        V = torch.zeros(in_features, rank, dtype=torch.bfloat16)
 
         if trainable_quant:
             self.alpha = nn.Parameter(alpha)
@@ -77,7 +77,7 @@ class QuATernaryonLinear(nn.Module):
 
         # 2. Dequantize weight in rotated space
         alpha_rep = torch.repeat_interleave(self.alpha, self.group_size, dim=-1)
-        Wq = self.beta + alpha_rep * self.T
+        Wq = self.beta + alpha_rep * self.T.to(self.alpha.dtype)
         if self.rank > 0:
             Wq = Wq + self.U @ self.V.T
 
@@ -108,20 +108,24 @@ class QuATernaryonLinear(nn.Module):
             rank=rank,
             bias=has_bias,
             trainable_quant=trainable_quant
-        ).to(linear.weight.device)
+        ).to(device=linear.weight.device, dtype=linear.weight.dtype)
 
         if has_bias:
             mod.bias.data.copy_(linear.bias.data)
 
-        # 1. Rotate weight into isoclinic Clifford frame: W_rot = W @ R^T directly in O(d log d)
-        W_fp = linear.weight.data.float()  # (out_features, in_features)
-        W_rot = mod.rotor(W_fp)
+        # 1. Rotate weight into isoclinic Clifford frame: W_rot = W @ R^T
+        W_fp = linear.weight.data
+        if trainable_quant:
+            W_rot = mod.rotor(W_fp.float()).to(W_fp.dtype)
+        else:
+            # S^3 Rotor at identity init is exact identity matrix; avoid redundant O(d^2) compute
+            W_rot = W_fp
 
         # 2. Fast vectorized asymmetric ternary quantization with per-row offset beta
         beta, alpha, T, W_base = quantize_ternary_asymmetric(W_rot, group_size=group_size)
 
         # 3. Low-rank SVD correction on residual in rotated space
-        E_rot = W_rot - W_base
+        E_rot = (W_rot - W_base).float()
         if H is not None:
             R = mod.rotor.get_full_matrix().to(W_fp.device)
             H_rot = R @ H @ R.T
@@ -132,17 +136,17 @@ class QuATernaryonLinear(nn.Module):
         del W_rot, W_base, E_rot
 
         # 5. Populate buffers / parameters
-        mod.T.copy_(T.float())
+        mod.T.copy_(T.to(torch.int8))
         if trainable_quant:
-            mod.alpha.data.copy_(alpha)
-            mod.beta.data.copy_(beta)
-            mod.U.data.copy_(U)
-            mod.V.data.copy_(V)
+            mod.alpha.data.copy_(alpha.to(mod.alpha.dtype))
+            mod.beta.data.copy_(beta.to(mod.beta.dtype))
+            mod.U.data.copy_(U.to(mod.U.dtype))
+            mod.V.data.copy_(V.to(mod.V.dtype))
         else:
-            mod.alpha.copy_(alpha)
-            mod.beta.copy_(beta)
-            mod.U.copy_(U)
-            mod.V.copy_(V)
+            mod.alpha.copy_(alpha.to(mod.alpha.dtype))
+            mod.beta.copy_(beta.to(mod.beta.dtype))
+            mod.U.copy_(U.to(mod.U.dtype))
+            mod.V.copy_(V.to(mod.V.dtype))
 
         # 6. Compute exact honest bit-rate
         ent = ternary_entropy(T)
