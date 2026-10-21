@@ -132,11 +132,11 @@ class QuATernaryonRotorNetwork(nn.Module):
         x: (..., D)
         """
         orig_shape = x.shape
-        x_reshaped = x.view(-1, self.num_heads_64, 64)
+        x_reshaped = x.reshape(-1, self.num_heads_64, 64)
         out_heads = []
         for h, block in enumerate(self.blocks):
             out_heads.append(block(x_reshaped[:, h, :]))
-        out = torch.stack(out_heads, dim=1).view(*orig_shape)
+        out = torch.stack(out_heads, dim=1).reshape(*orig_shape)
         return out
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
@@ -145,9 +145,9 @@ class QuATernaryonRotorNetwork(nn.Module):
         y: (..., D)
         """
         orig_shape = y.shape
-        y_reshaped = y.view(-1, self.num_heads_64, 64)
+        y_reshaped = y.reshape(-1, self.num_heads_64, 64)
         out_heads = []
         for h, block in enumerate(self.blocks):
             out_heads.append(block.inverse(y_reshaped[:, h, :]))
-        out = torch.stack(out_heads, dim=1).view(*orig_shape)
+        out = torch.stack(out_heads, dim=1).reshape(*orig_shape)
         return out
