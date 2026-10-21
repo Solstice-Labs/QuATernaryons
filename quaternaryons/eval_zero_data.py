@@ -29,7 +29,12 @@ def generate_teacher_pool(
     Zero external corpus — reference == generator == evaluation domain.
     """
     vocab_size = teacher_model.config.vocab_size
-    g = torch.Generator(device="cpu").manual_seed(seed)
+    dev = torch.device(device)
+    if dev.type == "cuda":
+        g = torch.Generator(device=dev).manual_seed(seed)
+    else:
+        g = torch.Generator().manual_seed(seed)
+
     num_sequences = num_tokens // seq_len
     rows = []
     done = 0
@@ -40,13 +45,15 @@ def generate_teacher_pool(
     while done < num_sequences:
         b = min(batch_size, num_sequences - done)
         # Uniform initial random seed block of tokens
-        x = torch.randint(0, vocab_size, (b, blk_size), generator=g).to(device)
+        x = torch.randint(0, vocab_size, (b, blk_size), generator=g, device=dev)
 
-        # Autoregressively extend up to seq_len using teacher's top-k(40) distribution
+        # Autoregressively extend up to seq_len using teacher's top-k(40) distribution with KV cache
+        with torch.no_grad():
+            out = teacher_model(x, use_cache=True)
+            past_key_values = out.past_key_values
+            logits = out.logits[:, -1, :].float()
+
         while x.size(1) < seq_len:
-            curr_blk = min(blk_size, seq_len - x.size(1))
-            with torch.no_grad():
-                logits = teacher_model(x).logits[:, -1, :].float()  # (b, V)
             k = min(top_k, logits.size(-1))
             top_vals, _ = torch.topk(logits, k, dim=-1)
             # Truncate below top-k
@@ -58,6 +65,16 @@ def generate_teacher_pool(
             probs = torch.softmax(logits, dim=-1)
             nxt = torch.multinomial(probs, 1, generator=g)  # (b, 1)
             x = torch.cat([x, nxt], dim=1)
+
+            if x.size(1) < seq_len:
+                with torch.no_grad():
+                    out = teacher_model(nxt, past_key_values=past_key_values, use_cache=True)
+                    past_key_values = out.past_key_values
+                    logits = out.logits[:, -1, :].float()
+
+        del past_key_values
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
 
         rows.append(x.cpu())
         done += b
@@ -85,12 +102,15 @@ def evaluate_zero_data_distribution(
     teacher_model.eval()
     student_model.eval()
 
+    dev_t = next(teacher_model.parameters()).device
+    dev_s = next(student_model.parameters()).device
     num_seqs = pool_tokens.size(0)
     for i in range(num_seqs):
-        x = pool_tokens[i:i+1].to(device)  # (1, seq_len)
+        x_t = pool_tokens[i:i+1].to(dev_t)
+        x_s = pool_tokens[i:i+1].to(dev_s)
         with torch.no_grad():
-            ht = teacher_model(x).logits.float()
-            hs = student_model(x).logits.float()
+            ht = teacher_model(x_t).logits.float().to("cpu")
+            hs = student_model(x_s).logits.float().to("cpu")
 
         seq_len = ht.size(1)
         for s0 in range(0, seq_len - 1, micro_slice):

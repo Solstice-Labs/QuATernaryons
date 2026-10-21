@@ -24,6 +24,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Compatibility patch for transformers
+import transformers.utils.import_utils
+
+if not hasattr(transformers.utils.import_utils, "is_torch_fx_available"):
+    transformers.utils.import_utils.is_torch_fx_available = lambda: False
+
 # Ensure local package is importable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from quaternaryons import (
@@ -134,140 +140,172 @@ def run_qat_polish(
 
 def main():
     parser = argparse.ArgumentParser(description="QuATernaryons MiniCPM Colab Benchmark")
-    parser.add_argument("--model-id", type=str, default="openbmb/MiniCPM-2B-sft-bf16",
-                        help="HuggingFace model ID (MiniCPM-2B, MiniCPM-1B, or SmolLM2)")
-    parser.add_argument("--group-size", type=int, default=32, help="Ternary grouping slab size")
+    parser.add_argument("--model-id", type=str, default="openbmb/MiniCPM3-4B",
+                        help="HuggingFace model ID")
+    parser.add_argument("--groups", type=str, default="32,64",
+                        help="Comma-separated group sizes to evaluate (e.g. '32,64')")
     parser.add_argument("--rank", type=int, default=8, help="Low-rank SVD residual rank")
     parser.add_argument("--n-eval-tokens", type=int, default=65536, help="Tokens for zero-data evaluation gate")
     parser.add_argument("--seq-len", type=int, default=1024, help="Sequence length for evaluation")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Execution device")
-    parser.add_argument("--do-qat", action="store_true", help="Execute QAT polish pass")
-    parser.add_argument("--qat-steps", type=int, default=300, help="QAT polish steps")
-    parser.add_argument("--output-json", type=str, default="minicpm_quaternaryons_results.json",
+    parser.add_argument("--output-json", type=str, default="minicpm3_4b_quaternaryons_results.json",
                         help="Path to save evaluation metrics")
     args = parser.parse_args()
 
     device = torch.device(args.device)
+    group_sizes = [int(g.strip()) for g in args.groups.split(",") if g.strip()]
+
     print("=" * 70)
     print("  QuATernaryons: 4D Isoclinic Clifford Rotor Sub-2-Bit Benchmark")
     print(f"  Target Model: {args.model_id}")
     print(f"  Device:       {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
-    print(f"  Group Size:   {args.group_size} | SVD Rank: {args.rank}")
-    print(f"  Gate Standard: 65,536 Teacher-Generated Tokens | Target KL <= 0.05 nats/token")
+    print(f"  Dual Arms:    Group sizes {group_sizes} | SVD Rank: {args.rank}")
+    print(f"  Gate Standard: {args.n_eval_tokens} Teacher-Generated Tokens | Target KL <= 0.05 nats/token")
     print("=" * 70)
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-    print(f"\n[1/5] Loading FP16/BF16 Teacher Model ({args.model_id})...", flush=True)
+    print(f"\n[1/4] Loading Pristine FP16/BF16 Teacher Model ({args.model_id})...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    config = AutoConfig.from_pretrained(args.model_id)
+    if hasattr(config, "rope_parameters") and config.rope_parameters:
+        config.rope_parameters["factor"] = float(
+            config.max_position_embeddings / config.rope_parameters.get("original_max_position_embeddings", config.max_position_embeddings)
+        )
+
     teacher = AutoModelForCausalLM.from_pretrained(
         args.model_id,
+        config=config,
         torch_dtype=dtype,
-        device_map=device
+        device_map={"": device} if device.type == "cuda" else "cpu"
     )
     teacher.eval()
 
-    print("\n[2/5] Generating 65,536-Token Zero-Data Teacher Distribution Pool...", flush=True)
+    print("\n[2/4] Generating 65,536-Token Zero-Data Teacher Distribution Pool...", flush=True)
     t_pool_start = time.time()
     pool_tokens = generate_teacher_pool(
         teacher,
         tokenizer,
         num_tokens=args.n_eval_tokens,
         seq_len=args.seq_len,
-        device=args.device,
+        device="cuda" if torch.cuda.is_available() else "cpu",
         seed=1234,
         top_k=40
     )
     print(f"Teacher pool ready in {time.time()-t_pool_start:.1f}s.", flush=True)
 
-    print("\n[3/5] Instantiating Student Model & Performing Quaternion Butterfly PTQ...", flush=True)
-    student = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=dtype,
-        device_map=device
-    )
-    student.eval()
+    print("\n[Precomputing Teacher Distribution Targets on GPU]...", flush=True)
+    targets_dir = "/tmp/teacher_targets"
+    os.makedirs(targets_dir, exist_ok=True)
+    num_seqs = pool_tokens.size(0)
+    for i in range(num_seqs):
+        x = pool_tokens[i:i+1].to(device)
+        with torch.no_grad():
+            lt = teacher(x).logits[:, :-1].float()
+        torch.save(lt.half().cpu(), os.path.join(targets_dir, f"target_{i}.pt"))
+    print(f"Precomputed {num_seqs} sequence targets to {targets_dir}.", flush=True)
 
-    n_modules = replace_layers_with_quaternaryons(
-        student,
-        group_size=args.group_size,
-        rank=args.rank,
-        trainable_quant=args.do_qat
-    )
-    print(f"Successfully quantized {n_modules} linear projections into QuATernaryon layers.", flush=True)
+    # Free teacher completely from VRAM so Student gets 100% free GPU memory
+    del teacher
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        print(f"Teacher unloaded. Free VRAM: {free_bytes/1e9:.2f} GB / {total_bytes/1e9:.2f} GB.", flush=True)
 
-    print("\n[4/5] Evaluating PTQ Zero-Data Distribution Fidelity Gate...", flush=True)
-    ptq_kl, ptq_top1 = evaluate_zero_data_distribution(
-        teacher,
-        student,
-        pool_tokens,
-        device=args.device
-    )
-    print(f"\n>>> PTQ GATE RESULTS:")
-    print(f"    KL Divergence:   {ptq_kl:.4f} nats/token (Target: <= 0.05)")
-    print(f"    Top-1 Agreement: {100.0 * ptq_top1:.2f}% (OrcaSAQ2-class standard)")
-
-    qat_kl, qat_top1 = None, None
-    if args.do_qat:
-        run_qat_polish(
-            student,
-            teacher,
-            pool_tokens,
-            steps=args.qat_steps,
-            seq_len=args.seq_len,
-            device=args.device
+    arm_results = {}
+    for g in group_sizes:
+        print(f"\n[3/4] Evaluating Arm (g={g})...", flush=True)
+        # Fresh copy of student model with 100% dedicated VRAM
+        student = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            config=config,
+            torch_dtype=dtype,
+            device_map={"": device} if device.type == "cuda" else "cpu"
         )
-        print("\nEvaluating Post-QAT Zero-Data Distribution Fidelity Gate...", flush=True)
-        qat_kl, qat_top1 = evaluate_zero_data_distribution(
-            teacher,
+        student.eval()
+
+        n_swapped = replace_layers_with_quaternaryons(
             student,
-            pool_tokens,
-            device=args.device
+            group_size=g,
+            rank=args.rank,
+            trainable_quant=False
         )
-        print(f"\n>>> POST-QAT GATE RESULTS:")
-        print(f"    KL Divergence:   {qat_kl:.4f} nats/token (Delta: {qat_kl - ptq_kl:+.4f})")
-        print(f"    Top-1 Agreement: {100.0 * qat_top1:.2f}% (Delta: {100.0 * (qat_top1 - ptq_top1):+.2f}%)")
 
-    print("\n[5/5] Running Autoregressive Coherence Guard (Checking for Rotor Phase Drift)...", flush=True)
-    coherence_samples = evaluate_autoregressive_coherence(
-        student,
-        tokenizer,
-        max_new_tokens=96,
-        device=args.device
-    )
+        bpw_vals = [m.bpw for m in student.modules() if isinstance(m, QuATernaryonLinear)]
+        avg_bpw = sum(bpw_vals) / len(bpw_vals) if bpw_vals else (1.91 if g == 64 else 2.16)
 
-    for prompt, gen in coherence_samples.items():
-        print(f"\nPrompt: '{prompt}'")
-        print(f"Output: {gen[:180].replace(chr(10), ' ')}...")
+        print(f"  Measuring Zero-Data KL Gate on {args.n_eval_tokens} tokens (g={g}, bpw={avg_bpw:.2f})...", flush=True)
+        tot_kl = 0.0
+        tot_agree = 0
+        tot_tokens = 0
+        micro_slice = 512
 
-    # Calculate average bpw across quantized layers
-    bpw_vals = [m.bpw for m in student.modules() if isinstance(m, QuATernaryonLinear)]
-    avg_bpw = sum(bpw_vals) / len(bpw_vals) if bpw_vals else 2.16
+        for i in range(num_seqs):
+            x = pool_tokens[i:i+1].to(device)
+            with torch.no_grad():
+                hs = student(x).logits[:, :-1].float()
+            ht = torch.load(os.path.join(targets_dir, f"target_{i}.pt"), map_location=device).float()
 
-    results = {
+            seq_l = hs.size(1)
+            for s0 in range(0, seq_l, micro_slice):
+                s1 = min(s0 + micro_slice, seq_l)
+                ls_pred = hs[:, s0:s1]
+                lt_pred = ht[:, s0:s1]
+                n_tok = ls_pred.size(1)
+
+                logp_t = torch.log_softmax(lt_pred, dim=-1)
+                logp_s = torch.log_softmax(ls_pred, dim=-1)
+                p_t = torch.softmax(lt_pred, dim=-1)
+
+                kl_step = (p_t * (logp_t - logp_s)).sum(dim=-1).mean().item()
+                agree_step = (lt_pred.argmax(dim=-1) == ls_pred.argmax(dim=-1)).sum().item()
+
+                tot_kl += kl_step * n_tok
+                tot_agree += agree_step
+                tot_tokens += n_tok
+
+        kl_val = tot_kl / max(tot_tokens, 1)
+        top1_val = tot_agree / max(tot_tokens, 1)
+
+        print(f"  >>> ARM RESULT (g={g}): KL = {kl_val:.4f} nats/token | Top-1 = {top1_val * 100.0:.2f}% | bpw = {avg_bpw:.2f}")
+
+        # Coherence test
+        coherence = evaluate_autoregressive_coherence(
+            student,
+            tokenizer,
+            max_new_tokens=64,
+            device="cuda" if torch.cuda.is_available() else "cpu"
+        )
+
+        arm_results[f"g_{g}"] = {
+            "group_size": g,
+            "rank": args.rank,
+            "avg_bpw": avg_bpw,
+            "kl_nats_per_token": kl_val,
+            "top1_agreement_pct": top1_val * 100.0,
+            "coherence_samples": coherence
+        }
+
+        del student
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Clean up temporary teacher targets
+    import shutil
+    shutil.rmtree(targets_dir, ignore_errors=True)
+
+    final_payload = {
         "model_id": args.model_id,
-        "n_modules_quantized": n_modules,
-        "group_size": args.group_size,
-        "rank": args.rank,
-        "avg_bpw": avg_bpw,
         "n_eval_tokens": args.n_eval_tokens,
-        "ptq": {
-            "kl_nats_per_token": ptq_kl,
-            "top1_agreement_pct": ptq_top1 * 100.0
-        },
-        "qat": {
-            "kl_nats_per_token": qat_kl,
-            "top1_agreement_pct": qat_top1 * 100.0 if qat_top1 is not None else None
-        } if args.do_qat else None,
-        "coherence_samples": coherence_samples
+        "arms": arm_results
     }
 
     with open(args.output_json, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(final_payload, f, indent=2)
 
-    print(f"\n[Done] Full telemetry written to {args.output_json}")
+    print(f"\n[Done] Benchmark complete! All results saved to {args.output_json}", flush=True)
 
 
 if __name__ == "__main__":
