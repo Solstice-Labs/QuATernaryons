@@ -113,20 +113,23 @@ class QuATernaryonLinear(nn.Module):
         if has_bias:
             mod.bias.data.copy_(linear.bias.data)
 
-        # 1. Extract full orthogonal matrix R from the quaternion butterfly network
+        # 1. Rotate weight into isoclinic Clifford frame: W_rot = W @ R^T directly in O(d log d)
         W_fp = linear.weight.data.float()  # (out_features, in_features)
-        R = mod.rotor.get_full_matrix().to(W_fp.device)  # (in_features, in_features)
+        W_rot = mod.rotor(W_fp)
 
-        # 2. Rotate weight into isoclinic Clifford frame: W_rot = W @ R^T
-        W_rot = W_fp @ R.T
-
-        # 3. Asymmetric ternary quantization with per-row offset beta
+        # 2. Fast vectorized asymmetric ternary quantization with per-row offset beta
         beta, alpha, T, W_base = quantize_ternary_asymmetric(W_rot, group_size=group_size)
 
-        # 4. Low-rank SVD correction on residual in rotated space
+        # 3. Low-rank SVD correction on residual in rotated space
         E_rot = W_rot - W_base
-        H_rot = R @ H @ R.T if H is not None else None
+        if H is not None:
+            R = mod.rotor.get_full_matrix().to(W_fp.device)
+            H_rot = R @ H @ R.T
+            del R
+        else:
+            H_rot = None
         U, V = fit_low_rank_residual(E_rot, rank=rank, H=H_rot)
+        del W_rot, W_base, E_rot
 
         # 5. Populate buffers / parameters
         mod.T.copy_(T.float())
