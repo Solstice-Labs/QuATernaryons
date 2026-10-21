@@ -123,12 +123,18 @@ def fit_low_rank_residual(
     else:
         target = E
 
-    U, S, Vt = torch.linalg.svd(target, full_matrices=False)
-    r = min(rank, S.numel())
-    sq = S[:r].sqrt()
-
-    Ur = (U[:, :r] * sq.unsqueeze(0)).contiguous()
-    Vr = (sq.unsqueeze(1) * Vt[:r, :]).contiguous().T  # (in_dim, r)
+    if rank <= 16 and target.size(0) >= 512:
+        U, S, V = torch.svd_lowrank(target, q=rank, niter=4)
+        r = min(rank, S.numel())
+        sq = S[:r].sqrt()
+        Ur = (U[:, :r] * sq.unsqueeze(0)).contiguous()
+        Vr = (sq.unsqueeze(1) * V[:, :r].T).contiguous().T
+    else:
+        U, S, Vt = torch.linalg.svd(target, full_matrices=False)
+        r = min(rank, S.numel())
+        sq = S[:r].sqrt()
+        Ur = (U[:, :r] * sq.unsqueeze(0)).contiguous()
+        Vr = (sq.unsqueeze(1) * Vt[:r, :]).contiguous().T  # (in_dim, r)
 
     if H is not None:
         # Invert Cholesky transformation on Vr: Vr <- (Vr^T @ L^{-1})^T
