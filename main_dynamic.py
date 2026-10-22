@@ -146,8 +146,8 @@ upload_snapshot("TOKENS_LOADED", 10.0)
 
 # [3/5] Streaming Hessian Covariance Collection
 log("\n[3/5] Streaming Layer Covariance / Hessian Second Moments over Calibration Shards...")
-# We use the first 16 sequences (16,384 tokens) to compute running second moments
-n_calib = 16
+# Ingest the entire 65,536-token (64k) zero-data teacher pool into Hessian accumulation
+n_calib = num_sequences # 64 sequences = 65,536 tokens (full 64k tokens)
 hessians = {}
 
 # MiniCPM3 layer dimensions: hidden=2304, intermediate=5760
@@ -155,11 +155,12 @@ d_hidden = config.hidden_size
 d_mlp = config.intermediate_size
 n_layers = config.num_hidden_layers
 
+# Allocate Hessian buffers in 30 GB CPU RAM (5.5 GB total) to keep GPU VRAM completely clean
 for l in range(n_layers):
-    hessians[f"layer_{l}_attn_in"] = torch.zeros(d_hidden, d_hidden, dtype=torch.float32, device=teacher_device)
-    hessians[f"layer_{l}_attn_out"] = torch.zeros(d_hidden, d_hidden, dtype=torch.float32, device=teacher_device)
-    hessians[f"layer_{l}_mlp_in"] = torch.zeros(d_hidden, d_hidden, dtype=torch.float32, device=teacher_device)
-    hessians[f"layer_{l}_mlp_act"] = torch.zeros(d_mlp, d_mlp, dtype=torch.float32, device=teacher_device)
+    hessians[f"layer_{l}_attn_in"] = torch.zeros(d_hidden, d_hidden, dtype=torch.float32, device="cpu")
+    hessians[f"layer_{l}_attn_out"] = torch.zeros(d_hidden, d_hidden, dtype=torch.float32, device="cpu")
+    hessians[f"layer_{l}_mlp_in"] = torch.zeros(d_hidden, d_hidden, dtype=torch.float32, device="cpu")
+    hessians[f"layer_{l}_mlp_act"] = torch.zeros(d_mlp, d_mlp, dtype=torch.float32, device="cpu")
 
 calib_tokens_total = n_calib * seq_len
 
@@ -168,7 +169,9 @@ def make_hook(h_key):
     def hook_fn(module, input, output):
         x = input[0].detach() # (batch, seq, dim)
         x_flat = x.reshape(-1, x.size(-1)).float()
-        hessians[h_key].addmm_(x_flat.T, x_flat)
+        step_h = torch.mm(x_flat.T, x_flat).cpu()
+        hessians[h_key].add_(step_h)
+        del step_h, x_flat, x
     return hook_fn
 
 for l, layer in enumerate(teacher.model.layers):
@@ -177,14 +180,14 @@ for l, layer in enumerate(teacher.model.layers):
     hooks.append(layer.mlp.gate_proj.register_forward_hook(make_hook(f"layer_{l}_mlp_in")))
     hooks.append(layer.mlp.down_proj.register_forward_hook(make_hook(f"layer_{l}_mlp_act")))
 
-log(f"  Streaming forward pass across {n_calib} sequences ({calib_tokens_total} tokens)...")
+log(f"  Streaming forward pass across all {n_calib} sequences ({calib_tokens_total} tokens / 64k)...")
 t_hess_start = time.time()
 with torch.no_grad():
     for i in range(n_calib):
         x_seq = pool_tokens[i:i+1].to(teacher_device)
         teacher(x_seq, use_cache=False)
-        if (i + 1) % 4 == 0:
-            log(f"    Calibrated {i+1}/{n_calib} sequences...")
+        if (i + 1) % 8 == 0:
+            log(f"    Calibrated {i+1}/{n_calib} sequences ({((i+1)/n_calib)*100.0:.1f}%)...")
 
 for h in hooks:
     h.remove()
@@ -195,9 +198,9 @@ for k, H in hessians.items():
     H.div_(calib_tokens_total)
     diag_mean = torch.trace(H) / H.size(0)
     eps = 1e-4 * diag_mean
-    H.add_(torch.eye(H.size(0), dtype=H.dtype, device=H.device) * eps)
+    H.add_(torch.eye(H.size(0), dtype=H.dtype, device="cpu") * eps)
 
-log(f">>> Hessian covariance matrices collected in {time.time() - t_hess_start:.1f}s.")
+log(f">>> Full 64k Hessian covariance matrices collected in {time.time() - t_hess_start:.1f}s.")
 upload_snapshot("HESSIANS_COLLECTED", 25.0)
 
 # [4/5] Load Student & Execute Dynamic Mixed-Rank Quantization
@@ -275,7 +278,7 @@ for name in to_replace:
         group_size=g,
         rank=rank,
         H=H_student,
-        trainable_quant=False
+        trainable_quant=True
     )
     # Immediately release original float weights to keep VRAM clean
     module.weight.data = torch.empty(0, device=module.weight.device)
@@ -299,6 +302,73 @@ if torch.cuda.is_available():
 bpw_vals = [m.bpw for m in student.modules() if isinstance(m, QuATernaryonLinear)]
 avg_bpw = sum(bpw_vals) / len(bpw_vals) if bpw_vals else 2.08
 log(f"  >>> Dynamic Swapping Complete: {swapped} layers quantized. Average bpw: {avg_bpw:.3f}")
+upload_snapshot("STUDENT_QUANTIZED", 35.0)
+
+# [4.5/5] Continuous Parameter QAT Polish (300 Steps over 65,536-Token Distribution)
+log("\n[4.5/5] Running Continuous Parameter QAT Polish (Differentiable alpha, beta, U, V)...")
+student.train()
+teacher.eval()
+
+# Freeze non-quantized weights (embeddings, norms, lm_head), train only continuous parameters
+trainable_params = []
+for name, p in student.named_parameters():
+    if any(k in name for k in ("alpha", "beta", "U", "V", "rotor")):
+        p.requires_grad = True
+        trainable_params.append(p)
+    else:
+        p.requires_grad = False
+
+n_trainable = sum(p.numel() for p in trainable_params)
+log(f"  Trainable continuous parameters: {n_trainable / 1e6:.2f}M (Ternary core is frozen invariant)")
+
+if hasattr(student, "gradient_checkpointing_enable"):
+    student.gradient_checkpointing_enable()
+
+qat_steps = 300
+optimizer = torch.optim.AdamW(trainable_params, lr=1e-3, weight_decay=0.0)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=qat_steps)
+
+t_qat_start = time.time()
+for step in range(qat_steps):
+    seq_idx = torch.randint(0, num_sequences, (1,)).item()
+    x_batch = pool_tokens[seq_idx:seq_idx+1].to(student_device)
+
+    student_logits = student(x_batch).logits[:, :-1].float()
+    with torch.no_grad():
+        teacher_logits = teacher(x_batch.to(teacher_device), use_cache=False).logits[:, :-1].to(student_device).float()
+
+    loss = 0.0
+    seq_len_minus_1 = student_logits.size(1)
+    for s0 in range(0, seq_len_minus_1, 256):
+        s1 = min(s0 + 256, seq_len_minus_1)
+        sl = student_logits[:, s0:s1]
+        tl = teacher_logits[:, s0:s1]
+        lp_s = torch.log_softmax(sl, dim=-1)
+        lp_t = torch.log_softmax(tl, dim=-1)
+        pt = torch.softmax(tl, dim=-1)
+        loss = loss + (pt * (lp_t - lp_s)).sum(dim=-1).mean() * (s1 - s0) / seq_len_minus_1
+
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+    optimizer.step()
+    scheduler.step()
+
+    if (step + 1) % 50 == 0 or step == qat_steps - 1:
+        log(f"  QAT Step {step+1:3d}/{qat_steps} | KL Distillation Loss = {loss.item():.4f} nats/token ({time.time()-t_qat_start:.1f}s)")
+        upload_snapshot("QAT_POLISHING", 35.0 + ((step + 1) / qat_steps) * 15.0)
+
+if hasattr(student, "gradient_checkpointing_disable"):
+    student.gradient_checkpointing_disable()
+
+student.eval()
+del optimizer, scheduler, trainable_params
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+log(f">>> QAT Polish completed in {time.time() - t_qat_start:.1f}s.")
+upload_snapshot("QAT_COMPLETE", 50.0)
 
 # Activate Fast Cached Inference Path (50x Speedup)
 log("  Freezing pre-materialized weights for ultra-fast evaluation & text generation...")

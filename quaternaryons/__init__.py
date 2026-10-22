@@ -29,6 +29,10 @@ from .eval_zero_data import (
     evaluate_zero_data_distribution,
     evaluate_autoregressive_coherence
 )
+from .pack import (
+    pack_trits_5,
+    unpack_trits_5
+)
 
 __version__ = "0.2.0"
 __all__ = [
@@ -48,5 +52,7 @@ __all__ = [
     "QuATernaryonLinear",
     "generate_teacher_pool",
     "evaluate_zero_data_distribution",
-    "evaluate_autoregressive_coherence"
+    "evaluate_autoregressive_coherence",
+    "pack_trits_5",
+    "unpack_trits_5"
 ]
