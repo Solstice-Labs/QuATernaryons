@@ -19,13 +19,18 @@ print("  QuATernaryons Track 2: Dynamic Mixed-Rank + Hessian Whitening Pipeline"
 print(f"  Start Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}", flush=True)
 print("=" * 75, flush=True)
 
+# Ensure HF and GitHub authentication
+HF_TOKEN = os.environ.get("HF_TOKEN", "") or "hf_oauth_eyJhbGciOiJFZERTQSIsImtpZCI6IjVHZDBvd0g5MTM2eDZjc1FvbE1zcktNWUZoRVFoUm5PVVVybEpjOUhaUEEifQ.eyJzY29wZSI6WyJtYW5hZ2UtcmVwb3MiLCJ3cml0ZS1yZXBvcyIsInJlYWQtcmVwb3MiLCJnYXRlZC1yZXBvcyIsImNvbnRyaWJ1dGUtcmVwb3MiLCJ3cml0ZS1jb2xsZWN0aW9ucyIsInJlYWQtY29sbGVjdGlvbnMiLCJvcGVuaWQiLCJ3cml0ZS1kaXNjdXNzaW9ucyIsImluZmVyZW5jZS1hcGkiLCJqb2JzIiwid2ViaG9va3MiLCJyZWFkLWJpbGxpbmciLCJyZWFkLW1jcCJdLCJhdWQiOiJodHRwczovL2h1Z2dpbmdmYWNlLmNvIiwiY2xpZW50X2lkIjoiMjZiZTZiMDktOTFjNS00N2RhLTk4NjEtZDJkMmJiN2E3ZTM2Iiwic2Vzc2lvbklkIjoiNmFjYjBkNzAwODI0OGFjZThlZDIxZGY2IiwiaWF0IjoxNzkxOTg2MjQ3LCJqdGkiOiIxMTZkZDhhMi00Yzk3LTQwNmItYmFiMy04ZDIzMjZmNGZiNmIiLCJzdWIiOiI2N2MyZTg0NGUwOTIxYTU0MTBlZWMxMGEiLCJleHAiOjE3OTQ1NzgyNDcsImlzcyI6Imh0dHBzOi8vaHVnZ2luZ2ZhY2UuY28ifQ.Tmueghi5QPKqjlWULlLrATXceHcNgnWZzeSwscC2wQQNCcAIvYZdLoZfZ5OEmaM6vJElYSLwL6WA-Z6uwdJvDg"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "") or "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"
+
 # 1. Setup repository on Kaggle environment
 repo_dir = "/kaggle/working/QuATernaryons"
 if os.path.exists("/kaggle"):
     if os.path.exists(repo_dir):
         shutil.rmtree(repo_dir)
     print("\n[Cloning latest QuATernaryons from GitHub]...", flush=True)
-    subprocess.run(["git", "clone", "https://github.com/Solstice-Labs/QuATernaryons.git", repo_dir], check=True)
+    clone_url = f"https://x-access-token:{GITHUB_TOKEN}@github.com/Solstice-Labs/QuATernaryons.git"
+    subprocess.run(["git", "clone", clone_url, repo_dir], check=True)
     if repo_dir not in sys.path:
         sys.path.insert(0, repo_dir)
 elif os.path.exists("/Users/shreyangondaliya/Project Indexes/QuATernaryons"):
@@ -38,10 +43,6 @@ from huggingface_hub import HfApi, hf_hub_download
 
 from quaternaryons.module import QuATernaryonLinear
 from quaternaryons.eval_zero_data import evaluate_autoregressive_coherence
-
-# Ensure HF and GitHub authentication
-HF_TOKEN = os.environ.get("HF_TOKEN", "") or "hf_oauth_eyJhbGciOiJFZERTQSIsImtpZCI6IjVHZDBvd0g5MTM2eDZjc1FvbE1zcktNWUZoRVFoUm5PVVVybEpjOUhaUEEifQ.eyJzY29wZSI6WyJtYW5hZ2UtcmVwb3MiLCJ3cml0ZS1yZXBvcyIsInJlYWQtcmVwb3MiLCJnYXRlZC1yZXBvcyIsImNvbnRyaWJ1dGUtcmVwb3MiLCJ3cml0ZS1jb2xsZWN0aW9ucyIsInJlYWQtY29sbGVjdGlvbnMiLCJvcGVuaWQiLCJ3cml0ZS1kaXNjdXNzaW9ucyIsImluZmVyZW5jZS1hcGkiLCJqb2JzIiwid2ViaG9va3MiLCJyZWFkLWJpbGxpbmciLCJyZWFkLW1jcCJdLCJhdWQiOiJodHRwczovL2h1Z2dpbmdmYWNlLmNvIiwiY2xpZW50X2lkIjoiMjZiZTZiMDktOTFjNS00N2RhLTk4NjEtZDJkMmJiN2E3ZTM2Iiwic2Vzc2lvbklkIjoiNmFjYjBkNzAwODI0OGFjZThlZDIxZGY2IiwiaWF0IjoxNzkxOTg2MjQ3LCJqdGkiOiIxMTZkZDhhMi00Yzk3LTQwNmItYmFiMy04ZDIzMjZmNGZiNmIiLCJzdWIiOiI2N2MyZTg0NGUwOTIxYTU0MTBlZWMxMGEiLCJleHAiOjE3OTQ1NzgyNDcsImlzcyI6Imh0dHBzOi8vaHVnZ2luZ2ZhY2UuY28ifQ.Tmueghi5QPKqjlWULlLrATXceHcNgnWZzeSwscC2wQQNCcAIvYZdLoZfZ5OEmaM6vJElYSLwL6WA-Z6uwdJvDg"
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "") or "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"
 
 REPO_ID = "Solstice-AI/QuATernaryons-demo-POC-alpha"
 api = HfApi(token=HF_TOKEN)
