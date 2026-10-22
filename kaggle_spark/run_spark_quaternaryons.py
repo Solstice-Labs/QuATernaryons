@@ -44,6 +44,7 @@ def safe_create_sliding_window_causal_mask(*args, **kwargs):
 mu.create_sliding_window_causal_mask = safe_create_sliding_window_causal_mask
 
 from transformers import PreTrainedConfig, PreTrainedModel, AutoConfig, AutoTokenizer, AutoModelForCausalLM
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 PreTrainedConfig.validate = lambda self: None
 
@@ -53,6 +54,84 @@ def _patched_get_expanded_tied_weights_keys(self, all_submodels: bool = False) -
         self._tied_weights_keys = {k: "model.embedding.weight" for k in self._tied_weights_keys}
     return _original_get_expanded(self, all_submodels=all_submodels)
 PreTrainedModel.get_expanded_tied_weights_keys = _patched_get_expanded_tied_weights_keys
+
+def safe_spark_causal_forward(
+    self,
+    input_ids=None,
+    attention_mask=None,
+    position_ids=None,
+    past_key_values=None,
+    inputs_embeds=None,
+    labels=None,
+    use_cache=None,
+    cache_position=None,
+    logits_to_keep=0,
+    token_type_ids=None,
+    **kwargs,
+):
+    outputs = self.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        cache_position=cache_position,
+    )
+    hidden_states = outputs.last_hidden_state
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    hidden_states = hidden_states[:, slice_indices, :]
+
+    if self.config.tie_word_embeddings:
+        embed_weight = self.model.embedding.weight.to(hidden_states.device)
+        logits = F.linear(hidden_states, embed_weight)
+    else:
+        logits = self.lm_head(hidden_states)
+
+    loss = None
+    if labels is not None:
+        loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+
+    return CausalLMOutputWithPast(
+        loss=loss,
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=getattr(outputs, "attentions", None),
+    )
+
+def safe_spark_decoder_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple,
+    attention_mask: torch.Tensor = None,
+    past_key_values = None,
+    cache_position: torch.LongTensor = None,
+    position_ids: torch.LongTensor = None,
+    **kwargs,
+) -> torch.Tensor:
+    residual = hidden_states
+    hidden_states = self.input_layernorm(hidden_states)
+    hidden_states = hidden_states.to(residual.dtype)
+
+    hidden_states, _ = self.self_attn(
+        hidden_states=hidden_states,
+        position_embeddings=position_embeddings,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        cache_position=cache_position,
+        position_ids=position_ids,
+    )
+    hidden_states = residual + hidden_states
+
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = hidden_states.to(residual.dtype)
+
+    hidden_states = self.mlp(hidden_states)
+    hidden_states = residual + hidden_states
+
+    return hidden_states
 
 # Set deterministic seeds
 torch.manual_seed(20261022)
@@ -173,6 +252,10 @@ class QuATernaryonLinear(nn.Module):
         W_rot = self.beta + (alpha_exp * T_float) + residual
         return torch.matmul(W_rot, self.R)
 
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.reconstruct_weight()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         W_eff = self.reconstruct_weight().to(x.dtype)
         return F.linear(x, W_eff, self.bias)
@@ -227,6 +310,10 @@ class FusedQKVQuATernaryonLinear(nn.Module):
         W_rot = torch.cat([W_q, W_k, W_v], dim=0)
         return torch.matmul(W_rot, self.R)
 
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.reconstruct_weight()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         W_eff = self.reconstruct_weight().to(x.dtype)
         return F.linear(x, W_eff, self.bias)
@@ -239,9 +326,9 @@ def main():
     print(" DeepSeek Lead Scientist Specification: Target D_KL < 0.070 nats", flush=True)
     print("=" * 70, flush=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}", flush=True)
-    if device.type == "cuda":
+    if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)} (VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.2f} GB)", flush=True)
 
     model_id = "XHToken/Spark-X2.6-4B"
@@ -255,10 +342,18 @@ def main():
     model_cls = get_class_from_dynamic_module("modeling_spark.Spark2_5ForCausalLM", model_id)
     if isinstance(getattr(model_cls, "_tied_weights_keys", None), list):
         model_cls._tied_weights_keys = {k: "model.embedding.weight" for k in model_cls._tied_weights_keys}
+    model_cls.forward = safe_spark_causal_forward
 
-    # Ensure dynamic module has safe masking utils
+    decoder_cls = get_class_from_dynamic_module("modeling_spark.Spark2_5DecoderLayer", model_id)
+    decoder_cls.forward = safe_spark_decoder_forward
+
+    # Ensure dynamic module has safe masking utils and patched forwards
     for name, mod in list(sys.modules.items()):
         if "modeling_spark" in name:
+            if hasattr(mod, "Spark2_5ForCausalLM"):
+                mod.Spark2_5ForCausalLM.forward = safe_spark_causal_forward
+            if hasattr(mod, "Spark2_5DecoderLayer"):
+                mod.Spark2_5DecoderLayer.forward = safe_spark_decoder_forward
             if hasattr(mod, "create_causal_mask"):
                 mod.create_causal_mask = safe_create_causal_mask
             if hasattr(mod, "create_sliding_window_causal_mask"):
@@ -268,9 +363,8 @@ def main():
         model_id,
         config=config,
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=True
-    )
+    ).to(device)
     teacher.eval()
     print(f"Teacher loaded in {time.time()-t0:.1f}s.", flush=True)
 
@@ -340,9 +434,8 @@ def main():
         model_id,
         config=config,
         torch_dtype=torch.float16,
-        device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=True
-    )
+    ).to(device)
     student.eval()
 
     layers = student.model.layers
