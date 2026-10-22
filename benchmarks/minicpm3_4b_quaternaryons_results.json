@@ -1,0 +1,37 @@
+{
+  "model_id": "openbmb/MiniCPM3-4B",
+  "n_eval_tokens": 65536,
+  "arms": {
+    "g_32": {
+      "group_size": 32,
+      "rank": 8,
+      "avg_bpw": 2.1191180981935993,
+      "kl_nats_per_token": 1.0473430176983147,
+      "top1_agreement_pct": 76.45100195503422,
+      "student_perplexity": 6.797949658618419,
+      "teacher_perplexity": 2.602446304237231,
+      "coherence_samples": {
+        "Explain how quaternion algebra parameterizes 4D rotations:": "Explain how quaternion algebra parameterizes 4D rotations: \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+        "Write a Python function to compute the Fibonacci sequence efficiently:": "Write a Python function to compute the Fibonacci sequence efficiently:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+        "The fundamental reason sub-2-bit quantization suffers from outlier collapse is": "The fundamental reason sub-2-bit quantization suffers from outlier collapse is the mis-interpreted-mis-interpreted-mis-interpreted-mis-interpreted-mis-interpreted-mis-interpreted-mis-interpreted-mis-interpreted-mis-interpreted-mis-interpreted-mis-interpreted-mis-interpreted-mis-interpret",
+        "In quantum mechanics, the relationship between SU(2) and SO(3) is": "In quantum mechanics, the relationship between SU(2) and SO(3) is the same as the relationship between SU(2) and S(3).\n\n\n"
+      }
+    },
+    "g_64": {
+      "group_size": 64,
+      "rank": 8,
+      "avg_bpw": 1.8585521962373486,
+      "kl_nats_per_token": 1.246857029614371,
+      "top1_agreement_pct": 75.41239002932552,
+      "student_perplexity": 8.464537714724322,
+      "teacher_perplexity": 2.602446304237231,
+      "coherence_samples": {
+        "Explain how quaternion algebra parameterizes 4D rotations:": "Explain how quaternion algebra parameterizes 4D rotations:\n\n\n\n\n[1] 1: 2: 3:4:5:6:7:8:9:10:11:12:13:14:15:16:17:18:19:20:21",
+        "Write a Python function to compute the Fibonacci sequence efficiently:": "Write a Python function to compute the Fibonacci sequence efficiently:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+        "The fundamental reason sub-2-bit quantization suffers from outlier collapse is": "The fundamental reason sub-2-bit quantization suffers from outlier collapse is is the same reason that the same --------------------------------------------------------",
+        "In quantum mechanics, the relationship between SU(2) and SO(3) is": "In quantum mechanics, the relationship between SU(2) and SO(3) is is a concept that is in the nature of the.\n in the nature of the,,, and in the nature of the,,, and in the nature of the,, and in the nature of the, and in the nature of the, and in the nature of the, and in the nature of the"
+      }
+    }
+  },
+  "timestamp_utc": "2026-10-22 02:34:23 UTC"
+}
