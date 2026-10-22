@@ -64,6 +64,19 @@ class QuATernaryonLinear(nn.Module):
             self.register_parameter("bias", None)
 
         self.bpw = 2.0  # Default placeholder
+        self.register_buffer("Wq_eval", None)
+
+    def freeze_for_inference(self):
+        """Precomputes and caches Wq in rotated basis to eliminate redundant dynamic reconstruction per token."""
+        alpha_rep = torch.repeat_interleave(self.alpha, self.group_size, dim=-1)
+        Wq = self.beta + alpha_rep * self.T.to(self.alpha.dtype)
+        if self.rank > 0:
+            Wq = Wq + self.U @ self.V.T
+        self.register_buffer("Wq_eval", Wq)
+
+    def unfreeze(self):
+        """Clears cached Wq_eval buffer to free memory or resume QAT training."""
+        self.register_buffer("Wq_eval", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -75,11 +88,14 @@ class QuATernaryonLinear(nn.Module):
         # 1. Rotate activations via quaternion butterfly
         xr = self.rotor(x)
 
-        # 2. Dequantize weight in rotated space
-        alpha_rep = torch.repeat_interleave(self.alpha, self.group_size, dim=-1)
-        Wq = self.beta + alpha_rep * self.T.to(self.alpha.dtype)
-        if self.rank > 0:
-            Wq = Wq + self.U @ self.V.T
+        # 2. Dequantize weight in rotated space (fast cached path if frozen)
+        if hasattr(self, "Wq_eval") and self.Wq_eval is not None:
+            Wq = self.Wq_eval
+        else:
+            alpha_rep = torch.repeat_interleave(self.alpha, self.group_size, dim=-1)
+            Wq = self.beta + alpha_rep * self.T.to(self.alpha.dtype)
+            if self.rank > 0:
+                Wq = Wq + self.U @ self.V.T
 
         # 3. Linear projection
         y = F.linear(xr, Wq.to(xr.dtype), self.bias.to(xr.dtype) if self.bias is not None else None)

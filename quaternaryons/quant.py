@@ -149,8 +149,8 @@ def fit_low_rank_residual(
         Vr = (sq.unsqueeze(1) * Vt[:r, :]).contiguous().T  # (in_dim, r)
 
     if H is not None:
-        # Invert Cholesky transformation on Vr: Vr <- (Vr^T @ L^{-1})^T
-        Vr = torch.linalg.solve_triangular(L.T, Vr.T, upper=True).T
+        # Invert Cholesky transformation on Vr: L^T @ Vr_orig = Vr_whitened => Vr_orig = (L^T)^{-1} @ Vr_whitened
+        Vr = torch.linalg.solve_triangular(L.T, Vr, upper=True)
 
     return Ur, Vr
 
