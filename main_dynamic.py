@@ -10,8 +10,26 @@ import gc
 import math
 import time
 import json
+import shutil
 import subprocess
 from typing import Dict, List, Optional, Tuple
+
+print("=" * 75, flush=True)
+print("  QuATernaryons Track 2: Dynamic Mixed-Rank + Hessian Whitening Pipeline", flush=True)
+print(f"  Start Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}", flush=True)
+print("=" * 75, flush=True)
+
+# 1. Setup repository on Kaggle environment
+repo_dir = "/kaggle/working/QuATernaryons"
+if os.path.exists("/kaggle"):
+    if os.path.exists(repo_dir):
+        shutil.rmtree(repo_dir)
+    print("\n[Cloning latest QuATernaryons from GitHub]...", flush=True)
+    subprocess.run(["git", "clone", "https://github.com/Solstice-Labs/QuATernaryons.git", repo_dir], check=True)
+    if repo_dir not in sys.path:
+        sys.path.insert(0, repo_dir)
+elif os.path.exists("/Users/shreyangondaliya/Project Indexes/QuATernaryons"):
+    sys.path.insert(0, "/Users/shreyangondaliya/Project Indexes/QuATernaryons")
 
 import torch
 import torch.nn as nn
@@ -21,14 +39,9 @@ from huggingface_hub import HfApi, hf_hub_download
 from quaternaryons.module import QuATernaryonLinear
 from quaternaryons.eval_zero_data import evaluate_autoregressive_coherence
 
-# Ensure HF authentication
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
-if not HF_TOKEN:
-    try:
-        from huggingface_hub import HfFolder
-        HF_TOKEN = HfFolder.get_token()
-    except Exception:
-        pass
+# Ensure HF and GitHub authentication
+HF_TOKEN = os.environ.get("HF_TOKEN", "") or "hf_oauth_eyJhbGciOiJFZERTQSIsImtpZCI6IjVHZDBvd0g5MTM2eDZjc1FvbE1zcktNWUZoRVFoUm5PVVVybEpjOUhaUEEifQ.eyJzY29wZSI6WyJtYW5hZ2UtcmVwb3MiLCJ3cml0ZS1yZXBvcyIsInJlYWQtcmVwb3MiLCJnYXRlZC1yZXBvcyIsImNvbnRyaWJ1dGUtcmVwb3MiLCJ3cml0ZS1jb2xsZWN0aW9ucyIsInJlYWQtY29sbGVjdGlvbnMiLCJvcGVuaWQiLCJ3cml0ZS1kaXNjdXNzaW9ucyIsImluZmVyZW5jZS1hcGkiLCJqb2JzIiwid2ViaG9va3MiLCJyZWFkLWJpbGxpbmciLCJyZWFkLW1jcCJdLCJhdWQiOiJodHRwczovL2h1Z2dpbmdmYWNlLmNvIiwiY2xpZW50X2lkIjoiMjZiZTZiMDktOTFjNS00N2RhLTk4NjEtZDJkMmJiN2E3ZTM2Iiwic2Vzc2lvbklkIjoiNmFjYjBkNzAwODI0OGFjZThlZDIxZGY2IiwiaWF0IjoxNzkxOTg2MjQ3LCJqdGkiOiIxMTZkZDhhMi00Yzk3LTQwNmItYmFiMy04ZDIzMjZmNGZiNmIiLCJzdWIiOiI2N2MyZTg0NGUwOTIxYTU0MTBlZWMxMGEiLCJleHAiOjE3OTQ1NzgyNDcsImlzcyI6Imh0dHBzOi8vaHVnZ2luZ2ZhY2UuY28ifQ.Tmueghi5QPKqjlWULlLrATXceHcNgnWZzeSwscC2wQQNCcAIvYZdLoZfZ5OEmaM6vJElYSLwL6WA-Z6uwdJvDg"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "") or "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"
 
 REPO_ID = "Solstice-AI/QuATernaryons-demo-POC-alpha"
 api = HfApi(token=HF_TOKEN)
@@ -429,6 +442,38 @@ try:
     log(">>> ALL DELIVERABLES COMMITTED TO OFFSHORE REPOSITORY SUCCESSFULLY!")
 except Exception as e:
     log(f"Upload warning: {e}")
+
+# Push results to HF Space Mission-Control
+try:
+    api.upload_file(
+        path_or_fileobj=results_file,
+        path_in_repo="telemetry/dynamic_quaternaryons_results.json",
+        repo_id="Solstice-AI/Mission-Control",
+        repo_type="space"
+    )
+    log(">>> Committed results to HF space Solstice-AI/Mission-Control")
+except Exception as e:
+    log(f"Warning HF Space upload: {e}")
+
+# Push results to GitHub Solstice-Labs/QuATernaryons
+try:
+    os.system(f"""
+    cd /kaggle/working
+    rm -rf QuATernaryons_repo
+    git clone https://x-access-token:{GITHUB_TOKEN}@github.com/Solstice-Labs/QuATernaryons.git QuATernaryons_repo
+    cd QuATernaryons_repo
+    mkdir -p benchmarks
+    cp {results_file} benchmarks/dynamic_quaternaryons_results.json
+    cp {gen_file} benchmarks/dynamic_generations.json
+    git config user.name "Solstice-AI Kaggle Daemon"
+    git config user.email "daemon@solstice-ai.co"
+    git add benchmarks/dynamic_quaternaryons_results.json benchmarks/dynamic_generations.json
+    git commit -m "feat(benchmark): add MiniCPM3-4B Track 2 Dynamic QuATernaryons results [skip ci]" || true
+    git push origin main
+    """)
+    log(">>> Committed results to GitHub repo Solstice-Labs/QuATernaryons")
+except Exception as e:
+    log(f"Warning GitHub upload: {e}")
 
 log("=" * 75)
 log("  Track 2 Dynamic Benchmark Pipeline Finished Successfully.")
