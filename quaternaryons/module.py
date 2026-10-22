@@ -143,9 +143,12 @@ class QuATernaryonLinear(nn.Module):
         # 3. Low-rank SVD correction on residual in rotated space
         E_rot = (W_rot - W_base).float()
         if H is not None:
-            R = mod.rotor.get_full_matrix().to(W_fp.device)
-            H_rot = R @ H @ R.T
-            del R
+            if trainable_quant:
+                R = mod.rotor.get_full_matrix().to(device=H.device, dtype=H.dtype)
+                H_rot = R @ H @ R.T
+                del R
+            else:
+                H_rot = H
         else:
             H_rot = None
         U, V = fit_low_rank_residual(E_rot, rank=rank, H=H_rot)

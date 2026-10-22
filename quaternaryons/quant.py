@@ -127,30 +127,44 @@ def fit_low_rank_residual(
         device = E.device
         return torch.zeros(E.size(0), 0, device=device), torch.zeros(E.size(1), 0, device=device)
 
+    L = None
     if H is not None:
         # Whiten with Cholesky factor of Hessian: H = L L^T => E @ L
-        eps = 1e-6 * torch.trace(H) / H.size(0)
-        L = torch.linalg.cholesky(H + eps * torch.eye(H.size(0), dtype=H.dtype, device=H.device))
-        target = E @ L
+        H_f32 = H.to(device=E.device, dtype=torch.float32)
+        damp = 0.01 * torch.mean(torch.diag(H_f32))
+        diag_idx = torch.arange(H_f32.size(0), device=H_f32.device)
+        for mult in [1.0, 5.0, 20.0, 100.0]:
+            try:
+                H_d = H_f32.clone()
+                H_d[diag_idx, diag_idx] += damp * mult
+                L = torch.linalg.cholesky(H_d)
+                break
+            except torch._C._LinAlgError:
+                continue
+
+        if L is not None:
+            target = (E.float() @ L).to(E.dtype)
+        else:
+            target = E
     else:
         target = E
 
     if rank <= 16 and target.size(0) >= 512:
-        U, S, V = torch.svd_lowrank(target, q=rank, niter=4)
+        U, S, V = torch.svd_lowrank(target.float(), q=rank, niter=4)
         r = min(rank, S.numel())
         sq = S[:r].sqrt()
-        Ur = (U[:, :r] * sq.unsqueeze(0)).contiguous()
-        Vr = (sq.unsqueeze(1) * V[:, :r].T).contiguous().T
+        Ur = (U[:, :r] * sq.unsqueeze(0)).contiguous().to(E.dtype)
+        Vr = (sq.unsqueeze(1) * V[:, :r].T).contiguous().T.to(E.dtype)
     else:
-        U, S, Vt = torch.linalg.svd(target, full_matrices=False)
+        U, S, Vt = torch.linalg.svd(target.float(), full_matrices=False)
         r = min(rank, S.numel())
         sq = S[:r].sqrt()
-        Ur = (U[:, :r] * sq.unsqueeze(0)).contiguous()
-        Vr = (sq.unsqueeze(1) * Vt[:r, :]).contiguous().T  # (in_dim, r)
+        Ur = (U[:, :r] * sq.unsqueeze(0)).contiguous().to(E.dtype)
+        Vr = (sq.unsqueeze(1) * Vt[:r, :]).contiguous().T.to(E.dtype)
 
-    if H is not None:
+    if L is not None:
         # Invert Cholesky transformation on Vr: L^T @ Vr_orig = Vr_whitened => Vr_orig = (L^T)^{-1} @ Vr_whitened
-        Vr = torch.linalg.solve_triangular(L.T, Vr, upper=True)
+        Vr = torch.linalg.solve_triangular(L.T, Vr.float(), upper=True).to(E.dtype)
 
     return Ur, Vr
 
