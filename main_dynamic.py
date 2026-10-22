@@ -175,10 +175,24 @@ def make_hook(h_key):
     return hook_fn
 
 for l, layer in enumerate(teacher.model.layers):
-    hooks.append(layer.self_attn.q_proj.register_forward_hook(make_hook(f"layer_{l}_attn_in")))
-    hooks.append(layer.self_attn.o_proj.register_forward_hook(make_hook(f"layer_{l}_attn_out")))
-    hooks.append(layer.mlp.gate_proj.register_forward_hook(make_hook(f"layer_{l}_mlp_in")))
-    hooks.append(layer.mlp.down_proj.register_forward_hook(make_hook(f"layer_{l}_mlp_act")))
+    attn = layer.self_attn
+    mlp = layer.mlp
+    
+    q_mod = getattr(attn, "q_a_proj", None) or getattr(attn, "q_proj", None)
+    if q_mod is not None:
+        hooks.append(q_mod.register_forward_hook(make_hook(f"layer_{l}_attn_in")))
+
+    o_mod = getattr(attn, "o_proj", None)
+    if o_mod is not None:
+        hooks.append(o_mod.register_forward_hook(make_hook(f"layer_{l}_attn_out")))
+
+    gate_mod = getattr(mlp, "gate_proj", None)
+    if gate_mod is not None:
+        hooks.append(gate_mod.register_forward_hook(make_hook(f"layer_{l}_mlp_in")))
+
+    down_mod = getattr(mlp, "down_proj", None)
+    if down_mod is not None:
+        hooks.append(down_mod.register_forward_hook(make_hook(f"layer_{l}_mlp_act")))
 
 log(f"  Streaming forward pass across all {n_calib} sequences ({calib_tokens_total} tokens / 64k)...")
 t_hess_start = time.time()
@@ -228,7 +242,7 @@ def get_dynamic_config(mod_name: str, layer_idx: int) -> Tuple[int, int, Optiona
         rank = 14
         g = 32
         H = hessians.get(f"layer_{layer_idx}_mlp_act")
-    elif any(k in mod_name for k in ["q_proj", "k_proj", "v_proj"]):
+    elif any(k in mod_name for k in ["q_a_proj", "kv_a_proj", "q_proj", "k_proj", "v_proj"]):
         rank = 10 if is_boundary else 8
         g = 32
         H = hessians.get(f"layer_{layer_idx}_attn_in")
@@ -243,7 +257,11 @@ def get_dynamic_config(mod_name: str, layer_idx: int) -> Tuple[int, int, Optiona
         H = None
     return g, rank, H
 
-target_keywords = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+target_keywords = (
+    "q_a_proj", "q_b_proj", "kv_a_proj", "kv_b_proj",
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj"
+)
 to_replace = []
 for name, mod in student.named_modules():
     if isinstance(mod, nn.Linear) and any(k in name for k in target_keywords):
