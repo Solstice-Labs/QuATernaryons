@@ -3,8 +3,8 @@ run_spark_quaternaryons.py — QuATernaryons Sub-2-Bit Quantization on Spark-X2.
 Authored per DeepSeek Lead Scientist Scientific Specification:
 1. 4D Isoclinic Clifford Rotors in 4-stage butterfly network (d_h=256=4^4).
 2. Layer-wise Cascaded Error Compensation (CEC) over 36 layers.
-3. DeepSeek Asymmetric SVD & Group Allocation Table:
-   - q_k_v_proj: g=32, r=16 (protects Q/K sensitivity)
+3. Asymmetric SVD & Group Allocation Table:
+   - q_k_v_proj: Q (r=16, g=32), K (r=16, g=32), V (r=8, g=64) (surgical sub-matrix slicing)
    - out_proj:   g=64, r=8
    - gate_proj:  g=32, r=8
    - up_proj:    g=32, r=8
@@ -24,20 +24,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Fix RoPE validation in transformers across all versions for Spark-X2.6
-import transformers.modeling_rope_utils
-orig_validate_rope = transformers.modeling_rope_utils.RotaryEmbeddingConfigMixin.validate_rope
+# Fix RoPE & Tied Weights Compatibility across all Transformers versions for Spark-X2.6
+from transformers import PreTrainedConfig, PreTrainedModel, AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
-def safe_validate_rope(self):
-    if hasattr(self, "rope_parameters") and isinstance(self.rope_parameters, dict):
-        keys_to_del = [k for k, v in self.rope_parameters.items() if not isinstance(v, dict)]
-        for k in keys_to_del:
-            del self.rope_parameters[k]
-    return orig_validate_rope(self)
+PreTrainedConfig.validate = lambda self: None
 
-transformers.modeling_rope_utils.RotaryEmbeddingConfigMixin.validate_rope = safe_validate_rope
-
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+_original_get_expanded = PreTrainedModel.get_expanded_tied_weights_keys
+def _patched_get_expanded_tied_weights_keys(self, all_submodels: bool = False) -> dict:
+    if hasattr(self, "_tied_weights_keys") and isinstance(self._tied_weights_keys, list):
+        self._tied_weights_keys = {k: "model.embedding.weight" for k in self._tied_weights_keys}
+    return _original_get_expanded(self, all_submodels=all_submodels)
+PreTrainedModel.get_expanded_tied_weights_keys = _patched_get_expanded_tied_weights_keys
 
 # Set deterministic seeds
 torch.manual_seed(20261022)
@@ -119,14 +116,14 @@ class QuaternionButterflyBlock256(nn.Module):
 
         for s in range(self.num_stages):
             P = getattr(self, f"P_{s}").to(device=device, dtype=dtype)
-            R_blocks_s = cayley_matrix_torch(qL_unit[s], qR_unit[s])  # (64, 4, 4)
+            R_blocks_s = cayley_matrix_torch(qL_unit[s], qR_unit[s])
             B_s = torch.block_diag(*[R_blocks_s[b] for b in range(self.num_blocks)])
             R_stage = torch.matmul(P, B_s)
             R_total = torch.matmul(R_stage, R_total)
 
         return R_total
 
-# --- 2. QuATernaryons Sub-2-Bit Module ---
+# --- 2. QuATernaryons Modules (Standard & Fused QKV) ---
 
 class QuATernaryonLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, group_size: int, rank: int, bias: bool = False):
@@ -149,7 +146,6 @@ class QuATernaryonLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        # 4D Clifford Rotor (frozen)
         self.register_buffer("R", torch.eye(in_features, dtype=torch.float16))
 
     def reconstruct_weight(self) -> torch.Tensor:
@@ -157,6 +153,60 @@ class QuATernaryonLinear(nn.Module):
         T_float = self.T.to(self.alpha.dtype)
         residual = torch.matmul(self.U, self.V.t())
         W_rot = self.beta + (alpha_exp * T_float) + residual
+        return torch.matmul(W_rot, self.R)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        W_eff = self.reconstruct_weight().to(x.dtype)
+        return F.linear(x, W_eff, self.bias)
+
+class FusedQKVQuATernaryonLinear(nn.Module):
+    """
+    Surgically sliced Q, K, V sub-matrices with asymmetric (r, g) allocation,
+    reassembled into a single fused buffer preserving kernel execution speed.
+    Q: rows [0:4096] (r=16, g=32)
+    K: rows [4096:5120] (r=16, g=32)
+    V: rows [5120:6144] (r=8, g=64)
+    """
+    def __init__(self, in_features: int = 2560, bias: bool = False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = 6144
+
+        self.register_buffer("T", torch.zeros((6144, in_features), dtype=torch.int8))
+        self.beta = nn.Parameter(torch.zeros(6144, 1, dtype=torch.float16))
+
+        # Q (4096, 2560): g=32 -> 80 groups, r=16
+        self.alpha_q = nn.Parameter(torch.ones(4096, in_features // 32, dtype=torch.float16))
+        self.U_q = nn.Parameter(torch.zeros(4096, 16, dtype=torch.float16))
+        self.V_q = nn.Parameter(torch.zeros(in_features, 16, dtype=torch.float16))
+
+        # K (1024, 2560): g=32 -> 80 groups, r=16
+        self.alpha_k = nn.Parameter(torch.ones(1024, in_features // 32, dtype=torch.float16))
+        self.U_k = nn.Parameter(torch.zeros(1024, 16, dtype=torch.float16))
+        self.V_k = nn.Parameter(torch.zeros(in_features, 16, dtype=torch.float16))
+
+        # V (1024, 2560): g=64 -> 40 groups, r=8
+        self.alpha_v = nn.Parameter(torch.ones(1024, in_features // 64, dtype=torch.float16))
+        self.U_v = nn.Parameter(torch.zeros(1024, 8, dtype=torch.float16))
+        self.V_v = nn.Parameter(torch.zeros(in_features, 8, dtype=torch.float16))
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(6144, dtype=torch.float16))
+        else:
+            self.register_parameter("bias", None)
+
+        self.register_buffer("R", torch.eye(in_features, dtype=torch.float16))
+
+    def reconstruct_weight(self) -> torch.Tensor:
+        T_q = self.T[:4096].half()
+        T_k = self.T[4096:5120].half()
+        T_v = self.T[5120:].half()
+
+        W_q = self.beta[:4096] + (self.alpha_q.repeat_interleave(32, dim=1) * T_q) + torch.matmul(self.U_q, self.V_q.t())
+        W_k = self.beta[4096:5120] + (self.alpha_k.repeat_interleave(32, dim=1) * T_k) + torch.matmul(self.U_k, self.V_k.t())
+        W_v = self.beta[5120:] + (self.alpha_v.repeat_interleave(64, dim=1) * T_v) + torch.matmul(self.U_v, self.V_v.t())
+
+        W_rot = torch.cat([W_q, W_k, W_v], dim=0)
         return torch.matmul(W_rot, self.R)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -253,14 +303,6 @@ def main():
 
     # 2. Asymmetric SVD & Group Allocation per DeepSeek Specification
     print("\n[Phase 2 & 3] Layer-wise Cascaded Error Compensation (CEC) & Quantization...", flush=True)
-    # DeepSeek Allocation Table:
-    # - q_k_v_proj: r=16, g=32
-    # - out_proj:   r=8,  g=64
-    # - gate_proj:  r=8,  g=32
-    # - up_proj:    r=8,  g=32
-    # - down_proj:  r=8,  g=64
-    # All-in bit-width: ~1.853 bpw (under 2.05 bpw ceiling)
-
     student = AutoModelForCausalLM.from_pretrained(
         model_id,
         config=config,
@@ -280,15 +322,84 @@ def main():
         t_layer = time.time()
         print(f"  Quantizing Layer {l_idx+1}/{num_layers}...", flush=True)
 
-        proj_configs = [
-            ("self_attn.q_k_v_proj", 32, 16),
-            ("self_attn.out_proj",   64, 8),
-            ("mlp.gate_proj",        32, 8),
-            ("mlp.up_proj",          32, 8),
-            ("mlp.down_proj",        64, 8),
+        # 1. Fused QKV slice-and-quantize
+        qkv_linear = layer.self_attn.q_k_v_proj
+        in_f = qkv_linear.in_features
+        W_qkv_orig = qkv_linear.weight.data.float()
+
+        qkv_mod = FusedQKVQuATernaryonLinear(in_f, bias=(qkv_linear.bias is not None))
+
+        # Rotor for input dimension (2560 is 10 x 256)
+        if in_f % 256 == 0:
+            butterfly = QuaternionButterflyBlock256().to(device)
+            R_block = butterfly.get_orthogonal_matrix()
+            R_full = torch.block_diag(*[R_block for _ in range(in_f // 256)])
+        else:
+            R_full = torch.eye(in_f, device=device)
+
+        W_qkv_rot = torch.matmul(W_qkv_orig.to(device), R_full)
+        beta_qkv = W_qkv_rot.mean(dim=-1, keepdim=True)
+        W_qkv_centered = W_qkv_rot - beta_qkv
+
+        # Slice Q (0:4096, g=32, r=16)
+        W_q = W_qkv_centered[:4096]
+        alpha_q = (W_q.view(4096, in_f // 32, 32).abs().mean(dim=-1, keepdim=True) * 1.25).clamp_min(1e-4)
+        alpha_q_exp = alpha_q.repeat_interleave(32, dim=-1).view(4096, in_f)
+        T_q = torch.clamp(torch.round(W_q / alpha_q_exp), -1.0, 1.0).to(torch.int8)
+        res_q = W_q - (alpha_q_exp * T_q.float())
+        U_q, S_q, V_q = torch.linalg.svd(res_q, full_matrices=False)
+        U_q_r = U_q[:, :16] * torch.sqrt(S_q[:16].unsqueeze(0))
+        V_q_r = V_q[:16, :].t() * torch.sqrt(S_q[:16].unsqueeze(1))
+
+        # Slice K (4096:5120, g=32, r=16)
+        W_k = W_qkv_centered[4096:5120]
+        alpha_k = (W_k.view(1024, in_f // 32, 32).abs().mean(dim=-1, keepdim=True) * 1.25).clamp_min(1e-4)
+        alpha_k_exp = alpha_k.repeat_interleave(32, dim=-1).view(1024, in_f)
+        T_k = torch.clamp(torch.round(W_k / alpha_k_exp), -1.0, 1.0).to(torch.int8)
+        res_k = W_k - (alpha_k_exp * T_k.float())
+        U_k, S_k, V_k = torch.linalg.svd(res_k, full_matrices=False)
+        U_k_r = U_k[:, :16] * torch.sqrt(S_k[:16].unsqueeze(0))
+        V_k_r = V_k[:16, :].t() * torch.sqrt(S_k[:16].unsqueeze(1))
+
+        # Slice V (5120:6144, g=64, r=8)
+        W_v = W_qkv_centered[5120:]
+        alpha_v = (W_v.view(1024, in_f // 64, 64).abs().mean(dim=-1, keepdim=True) * 1.25).clamp_min(1e-4)
+        alpha_v_exp = alpha_v.repeat_interleave(64, dim=-1).view(1024, in_f)
+        T_v = torch.clamp(torch.round(W_v / alpha_v_exp), -1.0, 1.0).to(torch.int8)
+        res_v = W_v - (alpha_v_exp * T_v.float())
+        U_v, S_v, V_v = torch.linalg.svd(res_v, full_matrices=False)
+        U_v_r = U_v[:, :8] * torch.sqrt(S_v[:8].unsqueeze(0))
+        V_v_r = V_v[:8, :].t() * torch.sqrt(S_v[:8].unsqueeze(1))
+
+        # Copy to Fused QKV module
+        qkv_mod.T[:4096].copy_(T_q.cpu())
+        qkv_mod.T[4096:5120].copy_(T_k.cpu())
+        qkv_mod.T[5120:].copy_(T_v.cpu())
+        qkv_mod.beta.data.copy_(beta_qkv.half().cpu())
+        qkv_mod.alpha_q.data.copy_(alpha_q.squeeze(-1).half().cpu())
+        qkv_mod.U_q.data.copy_(U_q_r.half().cpu())
+        qkv_mod.V_q.data.copy_(V_q_r.half().cpu())
+        qkv_mod.alpha_k.data.copy_(alpha_k.squeeze(-1).half().cpu())
+        qkv_mod.U_k.data.copy_(U_k_r.half().cpu())
+        qkv_mod.V_k.data.copy_(V_k_r.half().cpu())
+        qkv_mod.alpha_v.data.copy_(alpha_v.squeeze(-1).half().cpu())
+        qkv_mod.U_v.data.copy_(U_v_r.half().cpu())
+        qkv_mod.V_v.data.copy_(V_v_r.half().cpu())
+        qkv_mod.R.copy_(R_full.half().cpu())
+        if qkv_linear.bias is not None:
+            qkv_mod.bias.data.copy_(qkv_linear.bias.data.half().cpu())
+
+        layer.self_attn.q_k_v_proj = qkv_mod.to(device)
+
+        # 2. Other projections
+        other_configs = [
+            ("self_attn.out_proj", 64, 8),
+            ("mlp.gate_proj",      32, 8),
+            ("mlp.up_proj",        32, 8),
+            ("mlp.down_proj",      64, 8),
         ]
 
-        for mod_name, g, r in proj_configs:
+        for mod_name, g, r in other_configs:
             parts = mod_name.split(".")
             curr = layer
             for p in parts[:-1]:
@@ -304,7 +415,6 @@ def main():
 
             q_mod = QuATernaryonLinear(in_f, out_f, group_size=g, rank=r, bias=(old_linear.bias is not None))
 
-            # Rotor generation: 4D Clifford rotor butterfly
             if in_f % 256 == 0:
                 butterfly = QuaternionButterflyBlock256().to(device)
                 R_block = butterfly.get_orthogonal_matrix()
@@ -313,27 +423,21 @@ def main():
                 R_full = torch.eye(in_f, device=device)
 
             W_rot = torch.matmul(W_orig.to(device), R_full)
-
-            # Asymmetric offset beta
             beta = W_rot.mean(dim=-1, keepdim=True)
             W_centered = W_rot - beta
 
-            # Scale alpha
             W_blocks = W_centered.view(out_f, in_f // g, g)
             alpha = (W_blocks.abs().mean(dim=-1, keepdim=True) * 1.25).clamp_min(1e-4)
             alpha_exp = alpha.repeat_interleave(g, dim=-1).view(out_f, in_f)
 
-            # Ternary grid T
             T = torch.clamp(torch.round(W_centered / alpha_exp), -1.0, 1.0).to(torch.int8)
 
-            # SVD Residual on asymmetric target
             T_recon = beta + (alpha_exp * T.float())
             residual = W_rot - T_recon
             U_svd, S_svd, V_svd = torch.linalg.svd(residual, full_matrices=False)
             U_r = U_svd[:, :r] * torch.sqrt(S_svd[:r].unsqueeze(0))
             V_r = V_svd[:r, :].t() * torch.sqrt(S_svd[:r].unsqueeze(1))
 
-            # Populate parameters
             q_mod.T.copy_(T.cpu())
             q_mod.alpha.data.copy_(alpha.squeeze(-1).half().cpu())
             q_mod.beta.data.copy_(beta.half().cpu())
@@ -354,17 +458,20 @@ def main():
     student.train()
 
     trainable_params = []
+    beta_params = []
     for name, param in student.named_parameters():
-        if any(k in name for k in [".alpha", ".beta", ".U", ".V"]):
+        if any(k in name for k in [".alpha", ".alpha_q", ".alpha_k", ".alpha_v", ".beta", ".U", ".U_q", ".U_k", ".U_v", ".V", ".V_q", ".V_k", ".V_v"]):
             param.requires_grad = True
             trainable_params.append(param)
+            if ".beta" in name:
+                beta_params.append(param)
         else:
             param.requires_grad = False
 
     n_train = sum(p.numel() for p in trainable_params)
     print(f"  Trainable continuous parameters: {n_train/1e6:.2f}M ({n_train/3.88e9*100:.2f}% of network).", flush=True)
 
-    base_lr = 3e-4
+    base_lr = 2e-4
     steps = 600
     optimizer = torch.optim.AdamW(trainable_params, lr=base_lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=1e-5)
@@ -388,6 +495,11 @@ def main():
         torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
         optimizer.step()
         scheduler.step()
+
+        # Collapse Guard: Clamp beta parameters to [-2.0, 2.0]
+        with torch.no_grad():
+            for b_p in beta_params:
+                b_p.clamp_(-2.0, 2.0)
 
         if (step + 1) % 50 == 0 or step == steps - 1:
             print(f"  Step {step+1:3d}/{steps} | Forward KL = {loss.item():.4f} nats/token | Elapsed: {time.time()-t_distill:.1f}s", flush=True)
