@@ -120,6 +120,12 @@ class QuATernaryonRotorNetwork(nn.Module):
             QuaternionButterflyBlock64(use_b_rotors=use_b_rotors)
             for _ in range(self.num_heads_64)
         ])
+        # Vectorized buffer for high-throughput batched forward execution
+        self.register_buffer("R_stack", torch.stack([b.get_full_matrix() for b in self.blocks]))
+
+    def sync_buffers(self):
+        """Re-synchronizes R_stack buffer if underlying rotor parameters change."""
+        self.R_stack = torch.stack([b.get_full_matrix() for b in self.blocks])
 
     def get_full_matrix(self) -> torch.Tensor:
         """Constructs the full D x D block-diagonal orthogonal matrix."""
@@ -133,10 +139,13 @@ class QuATernaryonRotorNetwork(nn.Module):
         """
         orig_shape = x.shape
         x_reshaped = x.reshape(-1, self.num_heads_64, 64)
-        out_heads = []
-        for h, block in enumerate(self.blocks):
-            out_heads.append(block(x_reshaped[:, h, :]))
-        out = torch.stack(out_heads, dim=1).reshape(*orig_shape)
+        if hasattr(self, "R_stack") and self.R_stack is not None:
+            out = torch.einsum('bhd,hed->bhe', x_reshaped, self.R_stack.to(x.dtype)).reshape(*orig_shape)
+        else:
+            out_heads = []
+            for h, block in enumerate(self.blocks):
+                out_heads.append(block(x_reshaped[:, h, :]))
+            out = torch.stack(out_heads, dim=1).reshape(*orig_shape)
         return out
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:

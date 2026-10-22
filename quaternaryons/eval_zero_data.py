@@ -147,10 +147,14 @@ def evaluate_autoregressive_coherence(
     tokenizer,
     prompts: Optional[List[str]] = None,
     max_new_tokens: int = 128,
-    device: str = "cuda"
-) -> Dict[str, str]:
+    device: str = "cuda",
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    repetition_penalty: float = 1.15
+) -> Dict[str, Dict[str, str]]:
     """
-    Autoregressive generation test to check for MC-generation dissociation / rotor drift.
+    Autoregressive generation test across both Greedy (T=0) and Stochastic Sampling (T>0)
+    with repetition penalty to guard against attractor loops and sampling crashes.
     """
     if prompts is None:
         prompts = [
@@ -164,12 +168,36 @@ def evaluate_autoregressive_coherence(
     model.eval()
     for p in prompts:
         inputs = tokenizer(p, return_tensors="pt").to(device)
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,  # Greedy decoding to test stability
-            pad_token_id=tokenizer.eos_token_id
-        )
-        gen_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        results[p] = gen_text
+        
+        # 1. Greedy Decoding (T=0)
+        try:
+            greedy_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id or tokenizer.pad_token_id
+            )
+            greedy_text = tokenizer.decode(greedy_ids[0], skip_special_tokens=True)
+        except Exception as e:
+            greedy_text = f"Greedy error: {e}"
+
+        # 2. Temperature Sampling (T=0.7, top_p=0.9, rep_penalty=1.15)
+        try:
+            temp_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                pad_token_id=tokenizer.eos_token_id or tokenizer.pad_token_id
+            )
+            temp_text = tokenizer.decode(temp_ids[0], skip_special_tokens=True)
+        except Exception as e:
+            temp_text = f"Sampling error: {e}"
+
+        results[p] = {
+            "greedy": greedy_text,
+            "sampled_temp_0.7": temp_text
+        }
     return results

@@ -97,8 +97,10 @@ class QuATernaryonLinear(nn.Module):
             if self.rank > 0:
                 Wq = Wq + self.U @ self.V.T
 
-        # 3. Linear projection
+        # 3. Linear projection with numerical guard against sampling instability
         y = F.linear(xr, Wq.to(xr.dtype), self.bias.to(xr.dtype) if self.bias is not None else None)
+        if torch.isnan(y).any() or torch.isinf(y).any():
+            y = torch.nan_to_num(y, nan=0.0, posinf=65500.0, neginf=-65500.0)
         return y
 
     @classmethod

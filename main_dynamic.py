@@ -351,20 +351,15 @@ for step in range(qat_steps):
     seq_idx = torch.randint(0, num_sequences, (1,)).item()
     x_batch = pool_tokens[seq_idx:seq_idx+1].to(student_device)
 
-    student_logits = student(x_batch).logits[:, :-1].float()
-    with torch.no_grad():
-        teacher_logits = teacher(x_batch.to(teacher_device), use_cache=False).logits[:, :-1].to(student_device).float()
+    # Fast forward on student device (Zero cross-GPU PCIe traffic)
+    student_logits = student(x_batch).logits[:, :-1]
+    targets = x_batch[:, 1:]
 
-    loss = 0.0
-    seq_len_minus_1 = student_logits.size(1)
-    for s0 in range(0, seq_len_minus_1, 256):
-        s1 = min(s0 + 256, seq_len_minus_1)
-        sl = student_logits[:, s0:s1]
-        tl = teacher_logits[:, s0:s1]
-        lp_s = torch.log_softmax(sl, dim=-1)
-        lp_t = torch.log_softmax(tl, dim=-1)
-        pt = torch.softmax(tl, dim=-1)
-        loss = loss + (pt * (lp_t - lp_s)).sum(dim=-1).mean() * (s1 - s0) / seq_len_minus_1
+    # Causal LM Cross-Entropy on Teacher Distribution Tokens
+    loss = torch.nn.functional.cross_entropy(
+        student_logits.reshape(-1, student_logits.size(-1)),
+        targets.reshape(-1)
+    )
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -372,9 +367,10 @@ for step in range(qat_steps):
     optimizer.step()
     scheduler.step()
 
-    if (step + 1) % 50 == 0 or step == qat_steps - 1:
-        log(f"  QAT Step {step+1:3d}/{qat_steps} | KL Distillation Loss = {loss.item():.4f} nats/token ({time.time()-t_qat_start:.1f}s)")
-        upload_snapshot("QAT_POLISHING", 35.0 + ((step + 1) / qat_steps) * 15.0)
+    if (step + 1) % 5 == 0 or step == qat_steps - 1:
+        log(f"  QAT Step {step+1:3d}/{qat_steps} | CE Distillation Loss = {loss.item():.4f} ({time.time()-t_qat_start:.1f}s)")
+        if (step + 1) % 25 == 0 or step == qat_steps - 1:
+            upload_snapshot("QAT_POLISHING", 35.0 + ((step + 1) / qat_steps) * 15.0)
 
 if hasattr(student, "gradient_checkpointing_disable"):
     student.gradient_checkpointing_disable()
@@ -464,9 +460,13 @@ coherence = evaluate_autoregressive_coherence(
 log(f"Autoregressive generation finished in {time.time() - t_gen_start:.2f}s!")
 
 log("\n--- AUTOREGRESSIVE GENERATION SAMPLES (Dynamic Mixed-Rank) ---")
-for prompt_text, generated_text in coherence.items():
+for prompt_text, gen_dict in coherence.items():
     log(f"[Prompt]: {prompt_text}")
-    log(f"[Student Output]: {generated_text.strip()}\n")
+    if isinstance(gen_dict, dict):
+        log(f"  [Greedy T=0]:     {gen_dict.get('greedy', '').strip()}")
+        log(f"  [Sampled T=0.7]:  {gen_dict.get('sampled_temp_0.7', '').strip()}\n")
+    else:
+        log(f"  [Output]: {str(gen_dict).strip()}\n")
 
 # Extract and Save Compact Sub-2-Bit Weight Tensors
 log("Extracting compact QuATernaryons sub-2-bit weight tensors...")
