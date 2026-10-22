@@ -83,7 +83,7 @@ def safe_spark_causal_forward(
     hidden_states = hidden_states[:, slice_indices, :]
 
     if self.config.tie_word_embeddings:
-        embed_weight = self.model.embedding.weight.to(hidden_states.device)
+        embed_weight = self.model.embedding.weight.to(device=hidden_states.device, dtype=hidden_states.dtype)
         logits = F.linear(hidden_states, embed_weight)
     else:
         logits = self.lm_head(hidden_states)
@@ -110,9 +110,15 @@ def safe_spark_decoder_forward(
     position_ids: torch.LongTensor = None,
     **kwargs,
 ) -> torch.Tensor:
-    residual = hidden_states
-    hidden_states = self.input_layernorm(hidden_states)
-    hidden_states = hidden_states.to(residual.dtype)
+    layer_dtype = getattr(self.mlp.gate_proj, "dtype", None)
+    if layer_dtype is None and hasattr(self.mlp.gate_proj, "weight"):
+        layer_dtype = self.mlp.gate_proj.weight.dtype
+    if layer_dtype is None:
+        layer_dtype = self.input_layernorm.weight.dtype
+
+    residual = hidden_states.to(layer_dtype)
+    hidden_states = self.input_layernorm(residual)
+    hidden_states = hidden_states.to(layer_dtype)
 
     hidden_states, _ = self.self_attn(
         hidden_states=hidden_states,
@@ -122,14 +128,14 @@ def safe_spark_decoder_forward(
         cache_position=cache_position,
         position_ids=position_ids,
     )
-    hidden_states = residual + hidden_states
+    hidden_states = residual + hidden_states.to(layer_dtype)
 
     residual = hidden_states
     hidden_states = self.post_attention_layernorm(hidden_states)
-    hidden_states = hidden_states.to(residual.dtype)
+    hidden_states = hidden_states.to(layer_dtype)
 
     hidden_states = self.mlp(hidden_states)
-    hidden_states = residual + hidden_states
+    hidden_states = residual + hidden_states.to(layer_dtype)
 
     return hidden_states
 
@@ -256,6 +262,10 @@ class QuATernaryonLinear(nn.Module):
     def weight(self) -> torch.Tensor:
         return self.reconstruct_weight()
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.alpha.dtype
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         W_eff = self.reconstruct_weight().to(x.dtype)
         return F.linear(x, W_eff, self.bias)
@@ -313,6 +323,10 @@ class FusedQKVQuATernaryonLinear(nn.Module):
     @property
     def weight(self) -> torch.Tensor:
         return self.reconstruct_weight()
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.alpha_q.dtype
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         W_eff = self.reconstruct_weight().to(x.dtype)
