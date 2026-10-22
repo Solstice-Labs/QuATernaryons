@@ -15,7 +15,10 @@ import numpy as np
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from .pack import pack_trits_5
+try:
+    from .pack import pack_trits_5
+except ImportError:
+    from quaternaryons.pack import pack_trits_5
 
 
 def export_quaternaryons_to_gguf(
