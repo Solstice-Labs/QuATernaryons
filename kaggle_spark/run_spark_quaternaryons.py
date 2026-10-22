@@ -24,7 +24,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Fix RoPE & Tied Weights Compatibility across all Transformers versions for Spark-X2.6
+# Fix RoPE, Tied Weights, and Masking Utils Compatibility across all Transformers versions for Spark-X2.6
+import transformers.masking_utils as mu
+
+orig_create_causal_mask = mu.create_causal_mask
+def safe_create_causal_mask(*args, **kwargs):
+    if "input_embeds" in kwargs:
+        kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
+    kwargs.pop("cache_position", None)
+    return orig_create_causal_mask(*args, **kwargs)
+mu.create_causal_mask = safe_create_causal_mask
+
+orig_create_sliding_window_causal_mask = mu.create_sliding_window_causal_mask
+def safe_create_sliding_window_causal_mask(*args, **kwargs):
+    if "input_embeds" in kwargs:
+        kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
+    kwargs.pop("cache_position", None)
+    return orig_create_sliding_window_causal_mask(*args, **kwargs)
+mu.create_sliding_window_causal_mask = safe_create_sliding_window_causal_mask
+
 from transformers import PreTrainedConfig, PreTrainedModel, AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
 PreTrainedConfig.validate = lambda self: None
@@ -231,6 +249,21 @@ def main():
     t0 = time.time()
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    
+    # Pre-patch dynamic module before instantiation
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    model_cls = get_class_from_dynamic_module("modeling_spark.Spark2_5ForCausalLM", model_id)
+    if isinstance(getattr(model_cls, "_tied_weights_keys", None), list):
+        model_cls._tied_weights_keys = {k: "model.embedding.weight" for k in model_cls._tied_weights_keys}
+
+    # Ensure dynamic module has safe masking utils
+    for name, mod in list(sys.modules.items()):
+        if "modeling_spark" in name:
+            if hasattr(mod, "create_causal_mask"):
+                mod.create_causal_mask = safe_create_causal_mask
+            if hasattr(mod, "create_sliding_window_causal_mask"):
+                mod.create_sliding_window_causal_mask = safe_create_sliding_window_causal_mask
+
     teacher = AutoModelForCausalLM.from_pretrained(
         model_id,
         config=config,
