@@ -33,9 +33,10 @@ from .pack import (
     pack_trits_5,
     unpack_trits_5
 )
-from .export_gguf import (
-    export_quaternaryons_to_gguf
-)
+try:
+    from .export_gguf import export_quaternaryons_to_gguf
+except ImportError:
+    export_quaternaryons_to_gguf = None
 
 __version__ = "0.2.0"
 __all__ = [

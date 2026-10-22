@@ -13,7 +13,6 @@ from typing import Dict, Any, Optional
 
 import numpy as np
 import torch
-import gguf
 from transformers import AutoConfig, AutoTokenizer
 
 from .pack import pack_trits_5
@@ -28,6 +27,10 @@ def export_quaternaryons_to_gguf(
     """
     Exports QuATernaryons weights into a standalone ~1.1 GB GGUF model.
     """
+    try:
+        import gguf
+    except ImportError:
+        raise ImportError("gguf package is required for GGUF export. Run `pip install gguf`.")
     print(f"[GGUF Exporter] Loading config & tokenizer for {model_id}...", flush=True)
     config = AutoConfig.from_pretrained(model_id, token=hf_token)
     tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
