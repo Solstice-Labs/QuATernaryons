@@ -744,39 +744,52 @@ def main():
     gc.collect()
 
     torch.set_grad_enabled(True)
-    # 4. Continuous Parameter Distillation (PV-Tuning) + Alternating QAT
-    print("\n[Phase 4] Continuous Parameter Distillation + Alternating QAT...", flush=True)
+    # 4. Continuous Parameter Distillation (PV-Tuning) with DeepSeek Step 7745 Spec
+    print("\n[Phase 4] Continuous Parameter Distillation (Effective Batch: 8 seqs = 16k tokens)...", flush=True)
     student.train()
     student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
     if hasattr(student, "enable_input_require_grads"):
         student.enable_input_require_grads()
     torch.cuda.empty_cache()
 
-    trainable_params = []
+    # Parameter groups with layer-wise scaled learning rates: lambda_l = (1 - l / 36)^0.5
+    base_lr = 2e-4
+    param_groups = []
     beta_params = []
-    for name, param in student.named_parameters():
-        if any(k in name for k in [".alpha", ".alpha_q", ".alpha_k", ".alpha_v", ".beta", ".U", ".U_q", ".U_k", ".U_v", ".V", ".V_q", ".V_k", ".V_v"]):
-            param.requires_grad = True
-            trainable_params.append(param)
-            if ".beta" in name:
-                beta_params.append(param)
-        else:
-            param.requires_grad = False
+    for l_idx, layer in enumerate(student.model.layers):
+        l_scale = math.sqrt(max(0.1, 1.0 - (l_idx / 36.0)))
+        l_lr = base_lr * l_scale
+        l_params = []
+        for name, p in layer.named_parameters():
+            if any(k in name for k in [".alpha", ".alpha_q", ".alpha_k", ".alpha_v", ".beta", ".U", ".U_q", ".U_k", ".U_v", ".V", ".V_q", ".V_k", ".V_v"]):
+                p.requires_grad = True
+                l_params.append(p)
+                if ".beta" in name:
+                    beta_params.append(p)
+            else:
+                p.requires_grad = False
+        if l_params:
+            param_groups.append({"params": l_params, "lr": l_lr})
 
-    n_train = sum(p.numel() for p in trainable_params)
+    n_train = sum(sum(p.numel() for p in g["params"]) for g in param_groups)
     print(f"  Trainable continuous parameters: {n_train/1e6:.2f}M ({n_train/3.88e9*100:.2f}% of network).", flush=True)
 
-    base_lr = 2e-4
-    steps = 600
+    accum_steps = 8
+    total_seq_steps = 640  # 640 forward passes = 80 optimizer steps
+    num_opt_steps = total_seq_steps // accum_steps
+
     out_dir = "/kaggle/working/results" if os.path.exists("/kaggle") else ("/content/results" if os.path.exists("/content") else "./results")
     os.makedirs(out_dir, exist_ok=True)
 
-    optimizer = torch.optim.AdamW(trainable_params, lr=base_lr, weight_decay=0.01, foreach=False)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=1e-5)
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01, foreach=False)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_opt_steps, eta_min=1e-5)
 
     t_distill = time.time()
     chunk_size = 512
-    for step in range(steps):
+    optimizer.zero_grad(set_to_none=True)
+    accum_loss = 0.0
+
+    for step in range(total_seq_steps):
         seq_idx = step % n_seqs
         x = pool_tokens[seq_idx:seq_idx+1].to(device)
 
@@ -785,7 +798,7 @@ def main():
         t_logits = torch.load(f"/tmp/teacher_targets/target_{seq_idx}.pt", map_location="cpu")
 
         # Memory-efficient chunked forward KL Divergence
-        loss = 0.0
+        seq_kl = 0.0
         S = s_out.size(1)
         for c_start in range(0, S, chunk_size):
             c_end = min(c_start + chunk_size, S)
@@ -796,61 +809,46 @@ def main():
             logp_t = F.log_softmax(t_chunk, dim=-1)
 
             chunk_kl = F.kl_div(logp_s, logp_t, log_target=True, reduction='sum')
-            loss = loss + chunk_kl
+            seq_kl = seq_kl + chunk_kl
             del s_chunk, t_chunk, logp_s, logp_t, chunk_kl
 
-        loss = loss / S
+        norm_loss = (seq_kl / S) / accum_steps
+        if torch.isfinite(norm_loss):
+            norm_loss.backward()
+            accum_loss += (seq_kl.item() / S)
+        else:
+            print(f"  [Warning] Step {step+1}: Non-finite loss, skipping.", flush=True)
 
-        if not torch.isfinite(loss):
-            print(f"  [Warning] Step {step+1}: Non-finite loss ({loss.item()}), skipping step.", flush=True)
-            optimizer.zero_grad(set_to_none=True)
-            del s_out, t_logits, loss
-            continue
-
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        loss_val = loss.item()
-        del s_out, t_logits, loss
+        del s_out, t_logits, seq_kl, norm_loss
         torch.cuda.empty_cache()
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-        if torch.isfinite(grad_norm):
-            optimizer.step()
-            scheduler.step()
-        else:
-            print(f"  [Warning] Step {step+1}: Non-finite grad_norm ({grad_norm.item()}), skipping step.", flush=True)
+        # Optimizer Step every accum_steps (Effective Batch 8 sequences = 16k tokens)
+        if (step + 1) % accum_steps == 0:
+            all_params = [p for g in param_groups for p in g["params"]]
+            grad_norm = torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+            if torch.isfinite(grad_norm):
+                optimizer.step()
+                scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
-        # Collapse Guard: Clamp beta parameters to [-2.0, 2.0]
-        with torch.no_grad():
-            for b_p in beta_params:
-                b_p.data.clamp_(-2.0, 2.0)
-
-        # Alternating QAT Trit Absorption (Every 50 Steps)
-        if (step + 1) % 50 == 0:
+            # Collapse Guard: Clamp beta parameters to [-2.0, 2.0]
             with torch.no_grad():
-                for layer in student.model.layers:
-                    for name, mod in layer.named_modules():
-                        if isinstance(mod, QuATernaryonLinear):
-                            res = (mod.reconstruct_weight().float().view(-1, 256) @ mod.R_block.T).view(mod.out_features, mod.in_features) - mod.beta - (mod.U @ mod.V.T)
-                            alpha_exp = mod.alpha.repeat_interleave(mod.group_size, dim=1)
-                            mod.T.copy_(torch.clamp(torch.round(res / alpha_exp), -1.0, 1.0).to(torch.int8))
-                        elif isinstance(mod, FusedQKVQuATernaryonLinear):
-                            res = (mod.reconstruct_weight().float().view(-1, 256) @ mod.R_block.T).view(6144, mod.in_features) - mod.beta
-                            res_q = res[:4096] - (mod.U_q @ mod.V_q.T)
-                            res_k = res[4096:5120] - (mod.U_k @ mod.V_k.T)
-                            res_v = res[5120:] - (mod.U_v @ mod.V_v.T)
-                            mod.T[:4096].copy_(torch.clamp(torch.round(res_q / mod.alpha_q.repeat_interleave(32, dim=1)), -1.0, 1.0).to(torch.int8))
-                            mod.T[4096:5120].copy_(torch.clamp(torch.round(res_k / mod.alpha_k.repeat_interleave(32, dim=1)), -1.0, 1.0).to(torch.int8))
-                            mod.T[5120:].copy_(torch.clamp(torch.round(res_v / mod.alpha_v.repeat_interleave(64, dim=1)), -1.0, 1.0).to(torch.int8))
-            print(f"  [Alternating QAT] Trits dynamically updated across all projections at Step {step+1}!", flush=True)
+                for b_p in beta_params:
+                    b_p.data.clamp_(-2.0, 2.0)
 
-        # Intermediate Checkpoint Sharding (every 100 steps)
-        if (step + 1) % 100 == 0:
+            opt_idx = (step + 1) // accum_steps
+            avg_batch_kl = accum_loss / accum_steps
+            accum_loss = 0.0
+
+            if opt_idx % 5 == 0 or opt_idx == 1 or opt_idx == num_opt_steps:
+                print(f"  Batch {opt_idx:2d}/{num_opt_steps} (Step {step+1:3d}/{total_seq_steps}) | Forward KL = {avg_batch_kl:.4f} nats/token | Elapsed: {time.time()-t_distill:.1f}s (VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB)", flush=True)
+
+        # Intermediate Checkpoint Sharding (every 80 sequences = 10 batches)
+        if (step + 1) % 80 == 0:
             ckpt_shard = os.path.join(out_dir, f"spark_checkpoint_step_{step+1}.pt")
-            trainable_state = {k: v.cpu() for k, v in student.state_dict().items() if any(p in k for p in [".alpha", ".beta", ".U", ".V", ".T"])}
+            trainable_state = {k: v.cpu() for k, v in student.state_dict().items() if any(p in k for p in ['.alpha', '.beta', '.U', '.V'])}
             torch.save(trainable_state, ckpt_shard)
-            print(f"  [Checkpoint Shard] Saved {ckpt_shard} ({len(trainable_state)} tensors)", flush=True)
+            print(f"  [Checkpoint Shard] Saved {ckpt_shard} ({len(trainable_state)} tensors, {os.path.getsize(ckpt_shard)/1e6:.1f} MB)", flush=True)
             try:
                 from huggingface_hub import HfApi
                 api = HfApi(token=HF_TOKEN)
@@ -864,8 +862,13 @@ def main():
             except Exception as e:
                 print(f"  [Offshore Shard] HF upload notice: {e}", flush=True)
 
-        if (step + 1) % 25 == 0 or step == 0 or step == steps - 1:
-            print(f"  Step {step+1:3d}/{steps} | Forward KL = {loss_val:.4f} nats/token | Elapsed: {time.time()-t_distill:.1f}s (VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB)", flush=True)
+            # Clean older local checkpoints to strictly preserve 20 GB disk quota
+            for old_f in glob.glob(os.path.join(out_dir, "spark_checkpoint_step_*.pt")):
+                if old_f != ckpt_shard:
+                    try:
+                        os.remove(old_f)
+                    except Exception:
+                        pass
 
     print(f"Distillation completed in {time.time()-t_distill:.1f}s.", flush=True)
 
