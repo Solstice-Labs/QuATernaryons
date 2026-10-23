@@ -3,7 +3,7 @@ run_spark_quaternaryons.py — High-Fidelity QuATernaryons Sub-2-Bit Quantizatio
 Strict Implementation of DeepSeek Lead Scientist Specification (Steps 7411 & 7745):
 
 1. Calibrated 4D Clifford Rotor Butterfly Network (256 = 4^4) with Stage-wise Moment Equalizer Fitting (Theorem 1 / Lemma 3). Outlier kurtosis collapsed from ~135 to < 3.8.
-2. Layer-wise Cascaded Error Compensation (CEC) across all 36 layers with Drifted Activations.
+2. Layer-wise Cascaded Error Compensation (CEC) across all 36 layers with Drifted Activations captured via native forward hooks.
 3. Activation-Aware Block Coordinate Descent (5-10 sweeps) minimizing Tr(E S E^T).
 4. Activation-Whitened Asymmetric Low-Rank SVD: SVD on (W X - W_q X_hat) L, placing adapter on active error directions.
 5. Surgical Fused QKV Slicing with Non-Uniform Asymmetric Allocation:
@@ -123,55 +123,65 @@ def safe_spark_causal_forward(
         inputs_embeds=inputs_embeds,
         use_cache=use_cache,
         cache_position=cache_position,
-        **kwargs,
     )
-    hidden_states = outputs[0]
-    logits = self.lm_head(hidden_states)
+    hidden_states = outputs.last_hidden_state
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    hidden_states = hidden_states[:, slice_indices, :]
+
+    if self.config.tie_word_embeddings:
+        embed_weight = self.model.embedding.weight.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        logits = F.linear(hidden_states, embed_weight)
+    else:
+        logits = self.lm_head(hidden_states)
+
+    loss = None
+    if labels is not None:
+        loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+
     return CausalLMOutputWithPast(
-        loss=None,
+        loss=loss,
         logits=logits,
-        past_key_values=outputs.past_key_values if hasattr(outputs, "past_key_values") else None,
-        hidden_states=outputs.hidden_states if hasattr(outputs, "hidden_states") else None,
-        attentions=outputs.attentions if hasattr(outputs, "attentions") else None,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=getattr(outputs, "attentions", None),
     )
 
 def safe_spark_decoder_forward(
     self,
     hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_value = None,
-    output_attentions: Optional[bool] = False,
-    use_cache: Optional[bool] = False,
-    cache_position: Optional[torch.LongTensor] = None,
+    position_embeddings: tuple,
+    attention_mask: torch.Tensor = None,
+    past_key_values = None,
+    cache_position: torch.LongTensor = None,
+    position_ids: torch.LongTensor = None,
     **kwargs,
-) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-    residual = hidden_states
-    hidden_states = self.input_layernorm(hidden_states)
+) -> torch.Tensor:
+    layer_dtype = getattr(self.mlp.gate_proj, "dtype", None)
+    if layer_dtype is None:
+        layer_dtype = self.input_layernorm.weight.dtype
 
-    hidden_states, self_attn_weights, present_key_value = self.self_attn(
+    residual = hidden_states.to(layer_dtype)
+    hidden_states = self.input_layernorm(residual)
+    hidden_states = hidden_states.to(layer_dtype)
+
+    hidden_states, _ = self.self_attn(
         hidden_states=hidden_states,
+        position_embeddings=position_embeddings,
         attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_value=past_key_value,
-        output_attentions=output_attentions,
-        use_cache=use_cache,
+        past_key_values=past_key_values,
         cache_position=cache_position,
-        **kwargs,
+        position_ids=position_ids,
     )
-    hidden_states = residual + hidden_states
+    hidden_states = residual + hidden_states.to(layer_dtype)
 
     residual = hidden_states
     hidden_states = self.post_attention_layernorm(hidden_states)
-    hidden_states = self.mlp(hidden_states)
-    hidden_states = residual + hidden_states
+    hidden_states = hidden_states.to(layer_dtype)
 
-    outputs = (hidden_states,)
-    if output_attentions:
-        outputs += (self_attn_weights,)
-    if use_cache:
-        outputs += (present_key_value,)
-    return outputs
+    hidden_states = self.mlp(hidden_states)
+    hidden_states = residual + hidden_states.to(layer_dtype)
+
+    return hidden_states
 
 # =====================================================================
 # 1. 4D ISOCLINIC CLIFFORD ROTOR BUTTERFLY NETWORK (d=256=4^4)
@@ -516,6 +526,10 @@ def main():
         teacher_ppl = math.exp(teacher_loss.item())
     print(f"  Teacher Baseline Perplexity on Gate: {teacher_ppl:.4f}", flush=True)
 
+    del teacher
+    torch.cuda.empty_cache()
+    gc.collect()
+
     # Load pristine student directly onto GPU
     print("\n[Phase 2 & 3] Calibrated Butterfly Weight Mixing + Sequential CEC...", flush=True)
     student = AutoModelForCausalLM.from_pretrained(
@@ -525,21 +539,6 @@ def main():
         trust_remote_code=True
     ).to(device)
     student.eval()
-
-    # Pre-collect initial layer 0 activations
-    print("  Collecting baseline layer 0 activation stream...", flush=True)
-    drifted_acts = []
-    with torch.no_grad():
-        for i in range(min(8, n_seqs)):
-            inp = pool_tokens[i:i+1].to(device)
-            emb = student.model.embedding(inp) if hasattr(student.model, "embedding") else student.model.embed_tokens(inp)
-            drifted_acts.append(emb.squeeze(0).cpu())
-    drifted_acts = torch.cat(drifted_acts, dim=0) # (16384, 2560)
-    print(f"  Activation sample collected: {drifted_acts.shape}", flush=True)
-
-    del teacher
-    torch.cuda.empty_cache()
-    gc.collect()
 
     layers = student.model.layers
     num_layers = len(layers)
@@ -552,8 +551,21 @@ def main():
         t_layer = time.time()
         print(f"  [CEC] Quantizing Layer {l_idx+1}/{num_layers} with Drifted Activations...", flush=True)
 
+        # Capture drifted activations entering this exact layer using native PyTorch hook
+        captured_acts = []
+        def act_hook(module, args, output):
+            captured_acts.append(args[0].detach())
+
+        hook_handle = layer.register_forward_hook(act_hook)
+        with torch.no_grad():
+            for seq_i in range(2): # 4096 tokens sample
+                _ = student(pool_tokens[seq_i:seq_i+1].to(device))
+        hook_handle.remove()
+
+        X_layer = torch.cat(captured_acts, dim=1).squeeze(0).float() # (4096, 2560)
+        del captured_acts
+
         # Compute activation second-moment matrix S = X^T X / N on GPU
-        X_layer = drifted_acts[:4096].to(device).float()
         S = (X_layer.T @ X_layer) / X_layer.size(0)
         # Cholesky factor L for whitening: S = L L^T
         damp = 0.01 * torch.mean(torch.diag(S))
@@ -699,15 +711,8 @@ def main():
             del W_orig, W_rot, W_centered, residual, U_svd, V_svd, R_block
             torch.cuda.empty_cache()
 
-        # 3. Advance drifted activations through quantized layer to maintain CEC
-        with torch.no_grad():
-            layer_out = []
-            for b_idx in range(0, drifted_acts.size(0), 2048):
-                b_acts = drifted_acts[b_idx:b_idx+2048].unsqueeze(0).to(device).half()
-                b_out = layer(b_acts)[0]
-                layer_out.append(b_out.squeeze(0).cpu())
-            drifted_acts = torch.cat(layer_out, dim=0)
-
+        del X_layer, S, S_damped, L_chol
+        torch.cuda.empty_cache()
         print(f"  Layer {l_idx+1}/{num_layers} quantized & drifted in {time.time()-t_layer:.1f}s.", flush=True)
 
     print(f"\nCascaded Error Compensation complete in {time.time()-t_start_cec:.1f}s.", flush=True)
