@@ -717,17 +717,31 @@ def main():
 
     print(f"\nCascaded Error Compensation complete in {time.time()-t_start_cec:.1f}s.", flush=True)
 
+    torch.cuda.empty_cache()
+    gc.collect()
+
     # Initial Gate Evaluation after Calibrated CEC
     print("\n[Phase 3.5] Verifying Calibrated CEC Baseline on Gate...", flush=True)
     with torch.no_grad():
         gate_x = pool_tokens[0:1].to(device)
-        s_out = student(gate_x).logits[:, :-1].float()
-        t_logits = torch.load("/tmp/teacher_targets/target_0.pt", map_location=device).float()
-        logp_s = F.log_softmax(s_out, dim=-1)
-        logp_t = F.log_softmax(t_logits, dim=-1)
-        init_kl = F.kl_div(logp_s, logp_t, log_target=True, reduction='sum').item() / s_out.size(1)
+        s_out = student(gate_x).logits[:, :-1]
+        t_logits = torch.load("/tmp/teacher_targets/target_0.pt", map_location="cpu")
+        S = s_out.size(1)
+        init_kl = 0.0
+        chunk_size = 512
+        for c_start in range(0, S, chunk_size):
+            c_end = min(c_start + chunk_size, S)
+            s_chunk = s_out[:, c_start:c_end].float()
+            t_chunk = t_logits[:, c_start:c_end].to(device).float()
+            logp_s = F.log_softmax(s_chunk, dim=-1)
+            logp_t = F.log_softmax(t_chunk, dim=-1)
+            init_kl += F.kl_div(logp_s, logp_t, log_target=True, reduction='sum').item()
+            del s_chunk, t_chunk, logp_s, logp_t
+        init_kl = init_kl / S
         print(f"  >>> Initial Calibrated CEC Forward KL: {init_kl:.4f} nats/token (Target: ~0.3-0.5 nats)", flush=True)
-        del gate_x, s_out, t_logits, logp_s, logp_t
+        del gate_x, s_out, t_logits
+    torch.cuda.empty_cache()
+    gc.collect()
 
     torch.set_grad_enabled(True)
     # 4. Continuous Parameter Distillation (PV-Tuning) + Alternating QAT
@@ -818,11 +832,18 @@ def main():
                 for layer in student.model.layers:
                     for name, mod in layer.named_modules():
                         if isinstance(mod, QuATernaryonLinear):
-                            # Reconstruct rotated effective weight and re-quantize trits
                             res = (mod.reconstruct_weight().float().view(-1, 256) @ mod.R_block.T).view(mod.out_features, mod.in_features) - mod.beta - (mod.U @ mod.V.T)
                             alpha_exp = mod.alpha.repeat_interleave(mod.group_size, dim=1)
                             mod.T.copy_(torch.clamp(torch.round(res / alpha_exp), -1.0, 1.0).to(torch.int8))
-            print(f"  [Alternating QAT] Trits dynamically updated to absorb residual at Step {step+1}!", flush=True)
+                        elif isinstance(mod, FusedQKVQuATernaryonLinear):
+                            res = (mod.reconstruct_weight().float().view(-1, 256) @ mod.R_block.T).view(6144, mod.in_features) - mod.beta
+                            res_q = res[:4096] - (mod.U_q @ mod.V_q.T)
+                            res_k = res[4096:5120] - (mod.U_k @ mod.V_k.T)
+                            res_v = res[5120:] - (mod.U_v @ mod.V_v.T)
+                            mod.T[:4096].copy_(torch.clamp(torch.round(res_q / mod.alpha_q.repeat_interleave(32, dim=1)), -1.0, 1.0).to(torch.int8))
+                            mod.T[4096:5120].copy_(torch.clamp(torch.round(res_k / mod.alpha_k.repeat_interleave(32, dim=1)), -1.0, 1.0).to(torch.int8))
+                            mod.T[5120:].copy_(torch.clamp(torch.round(res_v / mod.alpha_v.repeat_interleave(64, dim=1)), -1.0, 1.0).to(torch.int8))
+            print(f"  [Alternating QAT] Trits dynamically updated across all projections at Step {step+1}!", flush=True)
 
         # Intermediate Checkpoint Sharding (every 100 steps)
         if (step + 1) % 100 == 0:
