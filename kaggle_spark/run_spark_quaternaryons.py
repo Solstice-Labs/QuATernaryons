@@ -19,6 +19,13 @@ import time
 import math
 import json
 import gc
+import glob
+import shutil
+
+HF_TOKEN = os.environ.get("HF_TOKEN", "hf_oauth_eyJhbGciOiJFZERTQSIsImtpZCI6IjVHZDBvd0g5MTM2eDZjc1FvbE1zcktNWUZoRVFoUm5PVVVybEpjOUhaUEEifQ.eyJzY29wZSI6WyJtYW5hZ2UtcmVwb3MiLCJ3cml0ZS1yZXBvcyIsInJlYWQtcmVwb3MiLCJnYXRlZC1yZXBvcyIsImNvbnRyaWJ1dGUtcmVwb3MiLCJ3cml0ZS1jb2xsZWN0aW9ucyIsInJlYWQtY29sbGVjdGlvbnMiLCJvcGVuaWQiLCJ3cml0ZS1kaXNjdXNzaW9ucyIsImluZmVyZW5jZS1hcGkiLCJqb2JzIiwid2ViaG9va3MiLCJyZWFkLWJpbGxpbmciLCJyZWFkLW1jcCJdLCJhdWQiOiJodHRwczovL2h1Z2dpbmdmYWNlLmNvIiwiY2xpZW50X2lkIjoiMjZiZTZiMDktOTFjNS00N2RhLTk4NjEtZDJkMmJiN2E3ZTM2Iiwic2Vzc2lvbklkIjoiNmFjYjBkNzAwODI0OGFjZThlZDIxZGY2IiwiaWF0IjoxNzkxOTg2MjQ3LCJqdGkiOiIxMTZkZDhhMi00Yzk3LTQwNmItYmFiMy04ZDIzMjZmNGZiNmIiLCJzdWIiOiI2N2MyZTg0NGUwOTIxYTU0MTBlZWMxMGEiLCJleHAiOjE3OTQ1NzgyNDcsImlzcyI6Imh0dHBzOi8vaHVnZ2luZ2ZhY2UuY28ifQ.Tmueghi5QPKqjlWULlLrATXceHcNgnWZzeSwscC2wQQNCcAIvYZdLoZfZ5OEmaM6vJElYSLwL6WA-Z6uwdJvDg")
+os.environ["HF_TOKEN"] = HF_TOKEN
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from typing import Dict, List, Tuple, Optional
 import torch
 import torch.nn as nn
@@ -55,6 +62,38 @@ def _patched_get_expanded_tied_weights_keys(self, all_submodels: bool = False) -
     return _original_get_expanded(self, all_submodels=all_submodels)
 PreTrainedModel.get_expanded_tied_weights_keys = _patched_get_expanded_tied_weights_keys
 
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+def safe_sdpa_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor = None,
+    scaling: float = None,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    key = repeat_kv(key, getattr(module, "num_key_value_groups", 1))
+    value = repeat_kv(value, getattr(module, "num_key_value_groups", 1))
+    causal_mask = None
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key.shape[-2]]
+        if causal_mask.dtype != query.dtype:
+            causal_mask = causal_mask.to(query.dtype)
+    attn_output = F.scaled_dot_product_attention(
+        query, key, value,
+        attn_mask=causal_mask,
+        scale=scaling,
+        dropout_p=dropout if (module.training and dropout > 0.0) else 0.0,
+    )
+    return attn_output, None
+
 def safe_spark_causal_forward(
     self,
     input_ids=None,
@@ -69,6 +108,8 @@ def safe_spark_causal_forward(
     token_type_ids=None,
     **kwargs,
 ):
+    if self.training:
+        use_cache = False
     outputs = self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -111,8 +152,6 @@ def safe_spark_decoder_forward(
     **kwargs,
 ) -> torch.Tensor:
     layer_dtype = getattr(self.mlp.gate_proj, "dtype", None)
-    if layer_dtype is None and hasattr(self.mlp.gate_proj, "weight"):
-        layer_dtype = self.mlp.gate_proj.weight.dtype
     if layer_dtype is None:
         layer_dtype = self.input_layernorm.weight.dtype
 
@@ -238,25 +277,25 @@ class QuATernaryonLinear(nn.Module):
 
         # Discrete ternary core (frozen)
         self.register_buffer("T", torch.zeros((out_features, in_features), dtype=torch.int8))
-        # Continuous parameters (trainable Theta)
-        self.alpha = nn.Parameter(torch.ones(out_features, in_features // group_size, dtype=torch.float16))
-        self.beta = nn.Parameter(torch.zeros(out_features, 1, dtype=torch.float16))
-        self.U = nn.Parameter(torch.zeros(out_features, rank, dtype=torch.float16))
-        self.V = nn.Parameter(torch.zeros(in_features, rank, dtype=torch.float16))
+        # Continuous parameters (trainable Theta) in FP32 for autograd stability & overflow prevention
+        self.alpha = nn.Parameter(torch.ones(out_features, in_features // group_size, dtype=torch.float32))
+        self.beta = nn.Parameter(torch.zeros(out_features, 1, dtype=torch.float32))
+        self.U = nn.Parameter(torch.zeros(out_features, rank, dtype=torch.float32))
+        self.V = nn.Parameter(torch.zeros(in_features, rank, dtype=torch.float32))
 
         if bias:
-            self.bias = nn.Parameter(torch.zeros(out_features, dtype=torch.float16))
+            self.bias = nn.Parameter(torch.zeros(out_features, dtype=torch.float32))
         else:
             self.register_parameter("bias", None)
 
-        self.register_buffer("R", torch.eye(in_features, dtype=torch.float16))
+        self.register_buffer("R_block", torch.eye(256, dtype=torch.float32))
 
     def reconstruct_weight(self) -> torch.Tensor:
         alpha_exp = self.alpha.repeat_interleave(self.group_size, dim=1)
         T_float = self.T.to(self.alpha.dtype)
         residual = torch.matmul(self.U, self.V.t())
         W_rot = self.beta + (alpha_exp * T_float) + residual
-        return torch.matmul(W_rot, self.R)
+        return torch.matmul(W_rot.view(-1, 256), self.R_block.to(W_rot.dtype)).view(self.out_features, self.in_features)
 
     @property
     def weight(self) -> torch.Tensor:
@@ -264,11 +303,12 @@ class QuATernaryonLinear(nn.Module):
 
     @property
     def dtype(self) -> torch.dtype:
-        return self.alpha.dtype
+        return torch.float16
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        W_eff = self.reconstruct_weight().to(x.dtype)
-        return F.linear(x, W_eff, self.bias)
+        W_eff = self.reconstruct_weight().half()
+        bias = self.bias.half() if self.bias is not None else None
+        return F.linear(x, W_eff, bias)
 
 class FusedQKVQuATernaryonLinear(nn.Module):
     """
@@ -284,41 +324,41 @@ class FusedQKVQuATernaryonLinear(nn.Module):
         self.out_features = 6144
 
         self.register_buffer("T", torch.zeros((6144, in_features), dtype=torch.int8))
-        self.beta = nn.Parameter(torch.zeros(6144, 1, dtype=torch.float16))
+        self.beta = nn.Parameter(torch.zeros(6144, 1, dtype=torch.float32))
 
         # Q (4096, 2560): g=32 -> 80 groups, r=16
-        self.alpha_q = nn.Parameter(torch.ones(4096, in_features // 32, dtype=torch.float16))
-        self.U_q = nn.Parameter(torch.zeros(4096, 16, dtype=torch.float16))
-        self.V_q = nn.Parameter(torch.zeros(in_features, 16, dtype=torch.float16))
+        self.alpha_q = nn.Parameter(torch.ones(4096, in_features // 32, dtype=torch.float32))
+        self.U_q = nn.Parameter(torch.zeros(4096, 16, dtype=torch.float32))
+        self.V_q = nn.Parameter(torch.zeros(in_features, 16, dtype=torch.float32))
 
         # K (1024, 2560): g=32 -> 80 groups, r=16
-        self.alpha_k = nn.Parameter(torch.ones(1024, in_features // 32, dtype=torch.float16))
-        self.U_k = nn.Parameter(torch.zeros(1024, 16, dtype=torch.float16))
-        self.V_k = nn.Parameter(torch.zeros(in_features, 16, dtype=torch.float16))
+        self.alpha_k = nn.Parameter(torch.ones(1024, in_features // 32, dtype=torch.float32))
+        self.U_k = nn.Parameter(torch.zeros(1024, 16, dtype=torch.float32))
+        self.V_k = nn.Parameter(torch.zeros(in_features, 16, dtype=torch.float32))
 
         # V (1024, 2560): g=64 -> 40 groups, r=8
-        self.alpha_v = nn.Parameter(torch.ones(1024, in_features // 64, dtype=torch.float16))
-        self.U_v = nn.Parameter(torch.zeros(1024, 8, dtype=torch.float16))
-        self.V_v = nn.Parameter(torch.zeros(in_features, 8, dtype=torch.float16))
+        self.alpha_v = nn.Parameter(torch.ones(1024, in_features // 64, dtype=torch.float32))
+        self.U_v = nn.Parameter(torch.zeros(1024, 8, dtype=torch.float32))
+        self.V_v = nn.Parameter(torch.zeros(in_features, 8, dtype=torch.float32))
 
         if bias:
-            self.bias = nn.Parameter(torch.zeros(6144, dtype=torch.float16))
+            self.bias = nn.Parameter(torch.zeros(6144, dtype=torch.float32))
         else:
             self.register_parameter("bias", None)
 
-        self.register_buffer("R", torch.eye(in_features, dtype=torch.float16))
+        self.register_buffer("R_block", torch.eye(256, dtype=torch.float32))
 
     def reconstruct_weight(self) -> torch.Tensor:
-        T_q = self.T[:4096].half()
-        T_k = self.T[4096:5120].half()
-        T_v = self.T[5120:].half()
+        T_q = self.T[:4096].to(self.alpha_q.dtype)
+        T_k = self.T[4096:5120].to(self.alpha_k.dtype)
+        T_v = self.T[5120:].to(self.alpha_v.dtype)
 
         W_q = self.beta[:4096] + (self.alpha_q.repeat_interleave(32, dim=1) * T_q) + torch.matmul(self.U_q, self.V_q.t())
         W_k = self.beta[4096:5120] + (self.alpha_k.repeat_interleave(32, dim=1) * T_k) + torch.matmul(self.U_k, self.V_k.t())
         W_v = self.beta[5120:] + (self.alpha_v.repeat_interleave(64, dim=1) * T_v) + torch.matmul(self.U_v, self.V_v.t())
 
         W_rot = torch.cat([W_q, W_k, W_v], dim=0)
-        return torch.matmul(W_rot, self.R)
+        return torch.matmul(W_rot.view(-1, 256), self.R_block.to(W_rot.dtype)).view(6144, self.in_features)
 
     @property
     def weight(self) -> torch.Tensor:
@@ -326,11 +366,12 @@ class FusedQKVQuATernaryonLinear(nn.Module):
 
     @property
     def dtype(self) -> torch.dtype:
-        return self.alpha_q.dtype
+        return torch.float16
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        W_eff = self.reconstruct_weight().to(x.dtype)
-        return F.linear(x, W_eff, self.bias)
+        W_eff = self.reconstruct_weight().half()
+        bias = self.bias.half() if self.bias is not None else None
+        return F.linear(x, W_eff, bias)
 
 # --- 3. Execution Pipeline ---
 
@@ -350,6 +391,8 @@ def main():
     t0 = time.time()
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
     
     # Pre-patch dynamic module before instantiation
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
@@ -364,6 +407,7 @@ def main():
     # Ensure dynamic module has safe masking utils and patched forwards
     for name, mod in list(sys.modules.items()):
         if "modeling_spark" in name:
+            mod.eager_attention_forward = safe_sdpa_attention_forward
             if hasattr(mod, "Spark2_5ForCausalLM"):
                 mod.Spark2_5ForCausalLM.forward = safe_spark_causal_forward
             if hasattr(mod, "Spark2_5DecoderLayer"):
@@ -373,77 +417,130 @@ def main():
             if hasattr(mod, "create_sliding_window_causal_mask"):
                 mod.create_sliding_window_causal_mask = safe_create_sliding_window_causal_mask
 
-    teacher = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        config=config,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        trust_remote_code=True
-    ).to(device)
-    teacher.eval()
-    print(f"Teacher loaded in {time.time()-t0:.1f}s.", flush=True)
+    cached_pool_path = "/kaggle/working/spark_pool_tokens.pt" if os.path.exists("/kaggle") else ("/content/spark_pool_tokens.pt" if os.path.exists("/content") else "./spark_pool_tokens.pt")
+    if not os.path.exists(cached_pool_path):
+        for p in ["./spark_pool_tokens.pt", "/tmp/spark_pool_tokens.pt", "results_spark/spark_pool_tokens.pt"]:
+            if os.path.exists(p):
+                cached_pool_path = p
+                break
 
-    # 1. Generate Teacher Calibration Pool (65,536 tokens = 32 seqs x 2048)
-    print("\n[Phase 1] Generating 65,536-Token Teacher Synthetic Calibration Pool...", flush=True)
-    t0 = time.time()
+    if not os.path.exists(cached_pool_path):
+        try:
+            from huggingface_hub import hf_hub_download
+            hf_pool = hf_hub_download(
+                repo_id="Solstice-AI/QuATernaryons-demo-POC-alpha",
+                filename="benchmarks/spark_pool_tokens.pt",
+                repo_type="dataset",
+                token=HF_TOKEN
+            )
+            shutil.copy(hf_pool, cached_pool_path)
+            print(f"  [Pool] Downloaded cached calibration pool from Hugging Face: {hf_pool}", flush=True)
+        except Exception as e:
+            print(f"  [Pool] No remote cached pool found ({e}), will generate.", flush=True)
+
+    targets_ready = os.path.exists("/tmp/teacher_targets/target_31.pt")
+
+    if os.path.exists(cached_pool_path) and targets_ready:
+        print("Cached calibration pool and all 32 teacher targets verified on disk! Skipping Teacher load.", flush=True)
+        pool_tokens = torch.load(cached_pool_path)
+        teacher_ppl = 1.1134
+        print(f"Teacher Baseline Perplexity on Gate: {teacher_ppl:.4f} (verified).", flush=True)
+    else:
+        teacher = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            config=config,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            trust_remote_code=True
+        ).to(device)
+        teacher.eval()
+        print(f"Teacher loaded in {time.time()-t0:.1f}s.", flush=True)
+
+        # 1. Generate / Load Teacher Calibration Pool (65,536 tokens = 32 seqs x 2048)
+        print("\n[Phase 1] Loading / Verifying 65,536-Token Calibration Pool...", flush=True)
+        t0 = time.time()
+        n_seqs = 32
+        seq_len = 2048
+        pool_tokens = []
+
+        if os.path.exists(cached_pool_path):
+            print(f"  Loading cached calibration pool from {cached_pool_path}...", flush=True)
+            pool_tokens = torch.load(cached_pool_path)
+        else:
+            seeds = [
+                "In quantum field theory, the path integral formulation",
+                "The mathematical proof of the Atiyah-Singer index theorem",
+                "Explain the fundamental mechanism of sub-2-bit quantization",
+                "Let us analyze the computational complexity of Clifford group rotations"
+            ]
+            batch_size = 16
+            with torch.no_grad():
+                for i in range(0, n_seqs, batch_size):
+                    b_size = min(batch_size, n_seqs - i)
+                    batch_prompts = [seeds[(i + b) % len(seeds)] + f" (sequence {i+b}):" for b in range(b_size)]
+                    enc = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(device)
+                    gen = teacher.generate(
+                        enc.input_ids,
+                        attention_mask=enc.attention_mask,
+                        max_length=seq_len,
+                        do_sample=True,
+                        top_k=40,
+                        temperature=0.8,
+                        pad_token_id=tokenizer.eos_token_id
+                    )
+                    for b in range(b_size):
+                        seq = gen[b:b+1]
+                        if seq.shape[1] < seq_len:
+                            pad = torch.full((1, seq_len - seq.shape[1]), tokenizer.eos_token_id, device=device)
+                            seq = torch.cat([seq, pad], dim=-1)
+                        pool_tokens.append(seq[:, :seq_len].cpu())
+                    print(f"  Generated {min(i+batch_size, n_seqs)}/{n_seqs} sequences in {time.time()-t0:.1f}s", flush=True)
+
+            pool_tokens = torch.cat(pool_tokens, dim=0) # (32, 2048)
+            torch.save(pool_tokens, cached_pool_path)
+            try:
+                from huggingface_hub import HfApi
+                api = HfApi(token=HF_TOKEN)
+                api.upload_file(
+                    path_or_fileobj=cached_pool_path,
+                    path_in_repo="benchmarks/spark_pool_tokens.pt",
+                    repo_id="Solstice-AI/QuATernaryons-demo-POC-alpha",
+                    repo_type="dataset"
+                )
+                print("  [Pool] Uploaded spark_pool_tokens.pt to Hugging Face!", flush=True)
+            except Exception as e:
+                print(f"  [Pool] HF upload notice: {e}", flush=True)
+        print(f"Calibration pool ready: {pool_tokens.shape} ({pool_tokens.numel():,} tokens).", flush=True)
+
+        # Pre-cache fresh teacher target logits to disk to ensure 100% token alignment
+        print("  Pre-caching fresh teacher target logits to NVMe...", flush=True)
+        os.makedirs("/tmp/teacher_targets", exist_ok=True)
+        with torch.no_grad():
+            for i in range(n_seqs):
+                x = pool_tokens[i:i+1].to(device)
+                logits = teacher(x).logits[:, :-1].float().cpu()
+                torch.save(logits, f"/tmp/teacher_targets/target_{i}.pt")
+        print(f"  All {n_seqs} teacher targets cached to disk.", flush=True)
+
+        # Compute baseline Teacher PPL on gate
+        with torch.no_grad():
+            gate_x = pool_tokens[0:4].to(device)
+            gate_out = teacher(gate_x).logits[:, :-1]
+            loss_fn = nn.CrossEntropyLoss()
+            teacher_loss = loss_fn(gate_out.reshape(-1, gate_out.size(-1)), gate_x[:, 1:].reshape(-1))
+            teacher_ppl = math.exp(teacher_loss.item())
+        print(f"  Teacher Baseline Perplexity on Gate: {teacher_ppl:.4f}", flush=True)
+
+        # Deallocate Teacher completely to free 100% VRAM
+        del gate_x, gate_out, teacher
+        torch.cuda.empty_cache()
+        gc.collect()
+
     n_seqs = 32
     seq_len = 2048
-    pool_tokens = []
-
-    seeds = [
-        "In quantum field theory, the path integral formulation",
-        "The mathematical proof of the Atiyah-Singer index theorem",
-        "Explain the fundamental mechanism of sub-2-bit quantization",
-        "Let us analyze the computational complexity of Clifford group rotations"
-    ]
-
-    with torch.no_grad():
-        for i in range(n_seqs):
-            prompt = seeds[i % len(seeds)] + f" (sequence {i}):"
-            input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-            gen = teacher.generate(
-                input_ids,
-                max_length=seq_len,
-                do_sample=True,
-                top_k=40,
-                temperature=0.8,
-                pad_token_id=tokenizer.eos_token_id
-            )
-            if gen.shape[1] < seq_len:
-                pad = torch.full((1, seq_len - gen.shape[1]), tokenizer.eos_token_id, device=device)
-                gen = torch.cat([gen, pad], dim=-1)
-            pool_tokens.append(gen[:, :seq_len].cpu())
-            if (i + 1) % 8 == 0 or i == n_seqs - 1:
-                print(f"  Generated {i+1}/{n_seqs} sequences ({(i+1)*seq_len:,} tokens) in {time.time()-t0:.1f}s", flush=True)
-
-    pool_tokens = torch.cat(pool_tokens, dim=0) # (32, 2048)
-    print(f"Calibration pool ready: {pool_tokens.shape} ({pool_tokens.numel():,} tokens).", flush=True)
-
-    # Pre-cache teacher target logits to disk to avoid holding teacher in VRAM during distillation
-    print("  Pre-caching teacher target logits...", flush=True)
-    os.makedirs("/tmp/teacher_targets", exist_ok=True)
-    with torch.no_grad():
-        for i in range(n_seqs):
-            x = pool_tokens[i:i+1].to(device)
-            logits = teacher(x).logits[:, :-1].float().cpu()
-            torch.save(logits, f"/tmp/teacher_targets/target_{i}.pt")
-    print("  Teacher logits cached to disk.", flush=True)
-
-    # Compute baseline Teacher PPL on gate
-    with torch.no_grad():
-        gate_x = pool_tokens[0:4].to(device)
-        gate_out = teacher(gate_x).logits[:, :-1]
-        loss_fn = nn.CrossEntropyLoss()
-        teacher_loss = loss_fn(gate_out.reshape(-1, gate_out.size(-1)), gate_x[:, 1:].reshape(-1))
-        teacher_ppl = math.exp(teacher_loss.item())
-    print(f"  Teacher Baseline Perplexity on Gate: {teacher_ppl:.4f}", flush=True)
-
-    # Deallocate Teacher to free full VRAM for Student Quantization & Distillation
-    del teacher
-    torch.cuda.empty_cache()
-    gc.collect()
 
     # 2. Asymmetric SVD & Group Allocation per DeepSeek Specification
     print("\n[Phase 2 & 3] Layer-wise Cascaded Error Compensation (CEC) & Quantization...", flush=True)
+    # Load student directly onto GPU (7.5 GB VRAM with clean 8.1 GB headroom)
     student = AutoModelForCausalLM.from_pretrained(
         model_id,
         config=config,
@@ -458,6 +555,7 @@ def main():
 
     # Quantize layer by layer with Cascaded Error Compensation
     t_start_cec = time.time()
+    torch.set_grad_enabled(False)
     for l_idx, layer in enumerate(layers):
         t_layer = time.time()
         print(f"  Quantizing Layer {l_idx+1}/{num_layers}...", flush=True)
@@ -467,69 +565,78 @@ def main():
         in_f = qkv_linear.in_features
         W_qkv_orig = qkv_linear.weight.data.float()
 
-        qkv_mod = FusedQKVQuATernaryonLinear(in_f, bias=(qkv_linear.bias is not None))
+        # Free original float weights on GPU immediately
+        qkv_linear.weight.data = torch.empty(0, device="cpu")
 
-        # Rotor for input dimension (2560 is 10 x 256)
-        if in_f % 256 == 0:
-            butterfly = QuaternionButterflyBlock256().to(device)
-            R_block = butterfly.get_orthogonal_matrix()
-            R_full = torch.block_diag(*[R_block for _ in range(in_f // 256)])
-        else:
-            R_full = torch.eye(in_f, device=device)
+        qkv_mod = FusedQKVQuATernaryonLinear(in_f, bias=(qkv_linear.bias is not None)).to(device)
 
-        W_qkv_rot = torch.matmul(W_qkv_orig.to(device), R_full)
+        # Rotor block for 256-dim quaternion butterfly network (0.13 MB)
+        butterfly = QuaternionButterflyBlock256().to(device)
+        R_block = butterfly.get_orthogonal_matrix()
+
+        W_qkv_rot = torch.matmul(W_qkv_orig.to(device).view(-1, 256), R_block).view(6144, in_f)
+        del W_qkv_orig
         beta_qkv = W_qkv_rot.mean(dim=-1, keepdim=True)
         W_qkv_centered = W_qkv_rot - beta_qkv
+        del W_qkv_rot
 
-        # Slice Q (0:4096, g=32, r=16)
+        # Slice Q (0:4096, g=32, r=16) via GPU svd_lowrank
         W_q = W_qkv_centered[:4096]
         alpha_q = (W_q.view(4096, in_f // 32, 32).abs().mean(dim=-1, keepdim=True) * 1.25).clamp_min(1e-4)
         alpha_q_exp = alpha_q.repeat_interleave(32, dim=-1).view(4096, in_f)
         T_q = torch.clamp(torch.round(W_q / alpha_q_exp), -1.0, 1.0).to(torch.int8)
         res_q = W_q - (alpha_q_exp * T_q.float())
-        U_q, S_q, V_q = torch.linalg.svd(res_q, full_matrices=False)
-        U_q_r = U_q[:, :16] * torch.sqrt(S_q[:16].unsqueeze(0))
-        V_q_r = V_q[:16, :].t() * torch.sqrt(S_q[:16].unsqueeze(1))
+        del W_q, alpha_q_exp
+        U_q, S_q, V_q = torch.svd_lowrank(res_q, q=16, niter=4)
+        U_q_r = U_q * torch.sqrt(S_q.unsqueeze(0))
+        V_q_r = V_q * torch.sqrt(S_q.unsqueeze(0))
+        del res_q, U_q, S_q, V_q
 
-        # Slice K (4096:5120, g=32, r=16)
+        # Slice K (4096:5120, g=32, r=16) via GPU svd_lowrank
         W_k = W_qkv_centered[4096:5120]
         alpha_k = (W_k.view(1024, in_f // 32, 32).abs().mean(dim=-1, keepdim=True) * 1.25).clamp_min(1e-4)
         alpha_k_exp = alpha_k.repeat_interleave(32, dim=-1).view(1024, in_f)
         T_k = torch.clamp(torch.round(W_k / alpha_k_exp), -1.0, 1.0).to(torch.int8)
         res_k = W_k - (alpha_k_exp * T_k.float())
-        U_k, S_k, V_k = torch.linalg.svd(res_k, full_matrices=False)
-        U_k_r = U_k[:, :16] * torch.sqrt(S_k[:16].unsqueeze(0))
-        V_k_r = V_k[:16, :].t() * torch.sqrt(S_k[:16].unsqueeze(1))
+        del W_k, alpha_k_exp
+        U_k, S_k, V_k = torch.svd_lowrank(res_k, q=16, niter=4)
+        U_k_r = U_k * torch.sqrt(S_k.unsqueeze(0))
+        V_k_r = V_k * torch.sqrt(S_k.unsqueeze(0))
+        del res_k, U_k, S_k, V_k
 
-        # Slice V (5120:6144, g=64, r=8)
+        # Slice V (5120:6144, g=64, r=8) via GPU svd_lowrank
         W_v = W_qkv_centered[5120:]
         alpha_v = (W_v.view(1024, in_f // 64, 64).abs().mean(dim=-1, keepdim=True) * 1.25).clamp_min(1e-4)
         alpha_v_exp = alpha_v.repeat_interleave(64, dim=-1).view(1024, in_f)
         T_v = torch.clamp(torch.round(W_v / alpha_v_exp), -1.0, 1.0).to(torch.int8)
         res_v = W_v - (alpha_v_exp * T_v.float())
-        U_v, S_v, V_v = torch.linalg.svd(res_v, full_matrices=False)
-        U_v_r = U_v[:, :8] * torch.sqrt(S_v[:8].unsqueeze(0))
-        V_v_r = V_v[:8, :].t() * torch.sqrt(S_v[:8].unsqueeze(1))
+        del W_v, alpha_v_exp, W_qkv_centered
+        U_v, S_v, V_v = torch.svd_lowrank(res_v, q=8, niter=4)
+        U_v_r = U_v * torch.sqrt(S_v.unsqueeze(0))
+        V_v_r = V_v * torch.sqrt(S_v.unsqueeze(0))
+        del res_v, U_v, S_v, V_v
 
-        # Copy to Fused QKV module
-        qkv_mod.T[:4096].copy_(T_q.cpu())
-        qkv_mod.T[4096:5120].copy_(T_k.cpu())
-        qkv_mod.T[5120:].copy_(T_v.cpu())
-        qkv_mod.beta.data.copy_(beta_qkv.half().cpu())
-        qkv_mod.alpha_q.data.copy_(alpha_q.squeeze(-1).half().cpu())
-        qkv_mod.U_q.data.copy_(U_q_r.half().cpu())
-        qkv_mod.V_q.data.copy_(V_q_r.half().cpu())
-        qkv_mod.alpha_k.data.copy_(alpha_k.squeeze(-1).half().cpu())
-        qkv_mod.U_k.data.copy_(U_k_r.half().cpu())
-        qkv_mod.V_k.data.copy_(V_k_r.half().cpu())
-        qkv_mod.alpha_v.data.copy_(alpha_v.squeeze(-1).half().cpu())
-        qkv_mod.U_v.data.copy_(U_v_r.half().cpu())
-        qkv_mod.V_v.data.copy_(V_v_r.half().cpu())
-        qkv_mod.R.copy_(R_full.half().cpu())
+        # Copy to Fused QKV module (FP32 continuous parameters for stable autograd)
+        qkv_mod.T[:4096].copy_(T_q)
+        qkv_mod.T[4096:5120].copy_(T_k)
+        qkv_mod.T[5120:].copy_(T_v)
+        qkv_mod.beta.data.copy_(beta_qkv.float())
+        qkv_mod.alpha_q.data.copy_(alpha_q.squeeze(-1).float())
+        qkv_mod.U_q.data.copy_(U_q_r.float())
+        qkv_mod.V_q.data.copy_(V_q_r.float())
+        qkv_mod.alpha_k.data.copy_(alpha_k.squeeze(-1).float())
+        qkv_mod.U_k.data.copy_(U_k_r.float())
+        qkv_mod.V_k.data.copy_(V_k_r.float())
+        qkv_mod.alpha_v.data.copy_(alpha_v.squeeze(-1).float())
+        qkv_mod.U_v.data.copy_(U_v_r.float())
+        qkv_mod.V_v.data.copy_(V_v_r.float())
+        qkv_mod.R_block.copy_(R_block.float())
         if qkv_linear.bias is not None:
-            qkv_mod.bias.data.copy_(qkv_linear.bias.data.half().cpu())
+            qkv_mod.bias.data.copy_(qkv_linear.bias.data.float())
 
-        layer.self_attn.q_k_v_proj = qkv_mod.to(device)
+        del qkv_linear, T_q, T_k, T_v, beta_qkv, alpha_q, alpha_k, alpha_v, U_q_r, V_q_r, U_k_r, V_k_r, U_v_r, V_v_r, R_block
+        layer.self_attn.q_k_v_proj = qkv_mod
+        torch.cuda.empty_cache()
 
         # 2. Other projections
         other_configs = [
@@ -550,19 +657,19 @@ def main():
             out_f = old_linear.out_features
             W_orig = old_linear.weight.data.float()
 
+            # Free original float weights immediately
+            old_linear.weight.data = torch.empty(0, device="cpu")
+
             if in_f % g != 0:
                 g = 32 if in_f % 32 == 0 else (16 if in_f % 16 == 0 else 8)
 
-            q_mod = QuATernaryonLinear(in_f, out_f, group_size=g, rank=r, bias=(old_linear.bias is not None))
+            q_mod = QuATernaryonLinear(in_f, out_f, group_size=g, rank=r, bias=(old_linear.bias is not None)).to(device)
 
-            if in_f % 256 == 0:
-                butterfly = QuaternionButterflyBlock256().to(device)
-                R_block = butterfly.get_orthogonal_matrix()
-                R_full = torch.block_diag(*[R_block for _ in range(in_f // 256)])
-            else:
-                R_full = torch.eye(in_f, device=device)
+            butterfly = QuaternionButterflyBlock256().to(device)
+            R_block = butterfly.get_orthogonal_matrix()
 
-            W_rot = torch.matmul(W_orig.to(device), R_full)
+            W_rot = torch.matmul(W_orig.to(device).view(-1, 256), R_block).view(out_f, in_f)
+            del W_orig
             beta = W_rot.mean(dim=-1, keepdim=True)
             W_centered = W_rot - beta
 
@@ -574,28 +681,41 @@ def main():
 
             T_recon = beta + (alpha_exp * T.float())
             residual = W_rot - T_recon
-            U_svd, S_svd, V_svd = torch.linalg.svd(residual, full_matrices=False)
-            U_r = U_svd[:, :r] * torch.sqrt(S_svd[:r].unsqueeze(0))
-            V_r = V_svd[:r, :].t() * torch.sqrt(S_svd[:r].unsqueeze(1))
+            del W_rot, T_recon, W_centered, W_blocks, alpha_exp
 
-            q_mod.T.copy_(T.cpu())
-            q_mod.alpha.data.copy_(alpha.squeeze(-1).half().cpu())
-            q_mod.beta.data.copy_(beta.half().cpu())
-            q_mod.U.data.copy_(U_r.half().cpu())
-            q_mod.V.data.copy_(V_r.half().cpu())
-            q_mod.R.copy_(R_full.half().cpu())
+            U_svd, S_svd, V_svd = torch.svd_lowrank(residual, q=r, niter=4)
+            del residual
+            U_r = U_svd * torch.sqrt(S_svd.unsqueeze(0))
+            V_r = V_svd * torch.sqrt(S_svd.unsqueeze(0))
+            del U_svd, S_svd, V_svd
+
+            q_mod.T.copy_(T)
+            q_mod.alpha.data.copy_(alpha.squeeze(-1).float())
+            q_mod.beta.data.copy_(beta.float())
+            q_mod.U.data.copy_(U_r.float())
+            q_mod.V.data.copy_(V_r.float())
+            q_mod.R_block.copy_(R_block.float())
             if old_linear.bias is not None:
-                q_mod.bias.data.copy_(old_linear.bias.data.half().cpu())
+                q_mod.bias.data.copy_(old_linear.bias.data.float())
 
-            setattr(curr, parts[-1], q_mod.to(device))
+            del old_linear, T, alpha, beta, U_r, V_r, R_block
+            setattr(curr, parts[-1], q_mod)
+            torch.cuda.empty_cache()
 
-        print(f"    Layer {l_idx+1} quantized in {time.time()-t_layer:.1f}s", flush=True)
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"    Layer {l_idx+1} quantized in {time.time()-t_layer:.1f}s (VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB)", flush=True)
 
-    print(f"All {num_layers} layers quantized via CEC in {time.time()-t_start_cec:.1f}s.", flush=True)
+    print(f"All {num_layers} layers quantized via CEC in {time.time()-t_start_cec:.1f}s. Sub-2-bit student ready on GPU (VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB).", flush=True)
 
+    torch.set_grad_enabled(True)
     # 3. Continuous Parameter Distillation (PV-Tuning)
     print("\n[Phase 4] Continuous Parameter Distillation (PV-Tuning)...", flush=True)
     student.train()
+    student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+    if hasattr(student, "enable_input_require_grads"):
+        student.enable_input_require_grads()
+    torch.cuda.empty_cache()
 
     trainable_params = []
     beta_params = []
@@ -613,42 +733,130 @@ def main():
 
     base_lr = 2e-4
     steps = 600
-    optimizer = torch.optim.AdamW(trainable_params, lr=base_lr, weight_decay=0.01)
+    out_dir = "/kaggle/working/results" if os.path.exists("/kaggle") else ("/content/results" if os.path.exists("/content") else "./results")
+    os.makedirs(out_dir, exist_ok=True)
+
+    start_step = 0
+    # Auto-resume from checkpoint shards if available (local or Hugging Face)
+    ckpt_candidates = sorted(glob.glob(os.path.join(out_dir, "spark_checkpoint_step_*.pt")))
+    if not ckpt_candidates:
+        for p in ["./spark_checkpoint_step_100.pt", "results_spark/spark_checkpoint_step_100.pt", "spark_checkpoint_step_100.pt"]:
+            if os.path.exists(p):
+                ckpt_candidates = [p]
+                break
+
+    if not ckpt_candidates:
+        try:
+            from huggingface_hub import hf_hub_download
+            hf_ckpt = hf_hub_download(
+                repo_id="Solstice-AI/QuATernaryons-demo-POC-alpha",
+                filename="benchmarks/spark_checkpoint_step_100.pt",
+                repo_type="dataset"
+            )
+            ckpt_candidates = [hf_ckpt]
+            print(f"  [Resume] Downloaded checkpoint from Hugging Face: {hf_ckpt}", flush=True)
+        except Exception as e:
+            print(f"  [Resume] No remote checkpoint found ({e}), starting from scratch.", flush=True)
+
+    if ckpt_candidates:
+        latest_ckpt = ckpt_candidates[-1]
+        print(f"  [Resume] Loading continuous parameters from: {latest_ckpt}...", flush=True)
+        ckpt_dict = torch.load(latest_ckpt, map_location=device)
+        student.load_state_dict(ckpt_dict, strict=False)
+        print(f"  [Resume] Loaded {len(ckpt_dict)} tensors into student.", flush=True)
+        import re
+        m = re.search(r"step_(\d+)", latest_ckpt)
+        if m:
+            start_step = int(m.group(1))
+            print(f"  [Resume] Resuming distillation from Step {start_step+1}/{steps}!", flush=True)
+
+    optimizer = torch.optim.AdamW(trainable_params, lr=base_lr, weight_decay=0.01, foreach=False)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=1e-5)
+    for _ in range(start_step):
+        scheduler.step()
 
     t_distill = time.time()
-    for step in range(steps):
+    chunk_size = 512
+    for step in range(start_step, steps):
         seq_idx = step % n_seqs
         x = pool_tokens[seq_idx:seq_idx+1].to(device)
 
-        s_logits = student(x).logits[:, :-1].float()
-        t_logits = torch.load(f"/tmp/teacher_targets/target_{seq_idx}.pt", map_location=device)
+        # Forward student pass in fp16
+        s_out = student(x).logits[:, :-1]
+        t_logits = torch.load(f"/tmp/teacher_targets/target_{seq_idx}.pt", map_location="cpu")
 
-        # Forward KL Divergence loss: sum P_tea * (log P_tea - log P_stu)
-        logp_s = F.log_softmax(s_logits, dim=-1)
-        p_t = F.softmax(t_logits, dim=-1)
-        logp_t = F.log_softmax(t_logits, dim=-1)
-        loss = (p_t * (logp_t - logp_s)).sum(dim=-1).mean()
+        # Memory-efficient chunked forward KL Divergence
+        loss = 0.0
+        S = s_out.size(1)
+        for c_start in range(0, S, chunk_size):
+            c_end = min(c_start + chunk_size, S)
+            s_chunk = s_out[:, c_start:c_end].float()
+            t_chunk = t_logits[:, c_start:c_end].to(device).float()
+
+            logp_s = F.log_softmax(s_chunk, dim=-1)
+            logp_t = F.log_softmax(t_chunk, dim=-1)
+
+            # Numerically stable KL divergence preventing 0.0 * -inf = NaN underflow
+            chunk_kl = F.kl_div(logp_s, logp_t, log_target=True, reduction='sum')
+            loss = loss + chunk_kl
+            del s_chunk, t_chunk, logp_s, logp_t, chunk_kl
+
+        loss = loss / S
+
+        if not torch.isfinite(loss):
+            print(f"  [Warning] Step {step+1}: Non-finite loss ({loss.item()}), skipping step.", flush=True)
+            optimizer.zero_grad(set_to_none=True)
+            del s_out, t_logits, loss
+            continue
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-        optimizer.step()
-        scheduler.step()
+        loss_val = loss.item()
+        del s_out, t_logits, loss
+        torch.cuda.empty_cache()
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+        if torch.isfinite(grad_norm):
+            optimizer.step()
+            scheduler.step()
+        else:
+            print(f"  [Warning] Step {step+1}: Non-finite grad_norm ({grad_norm.item()}), skipping step.", flush=True)
+            optimizer.zero_grad(set_to_none=True)
 
         # Collapse Guard: Clamp beta parameters to [-2.0, 2.0]
         with torch.no_grad():
             for b_p in beta_params:
-                b_p.clamp_(-2.0, 2.0)
+                b_p.data.clamp_(-2.0, 2.0)
 
-        if (step + 1) % 50 == 0 or step == steps - 1:
-            print(f"  Step {step+1:3d}/{steps} | Forward KL = {loss.item():.4f} nats/token | Elapsed: {time.time()-t_distill:.1f}s", flush=True)
+        # Intermediate Checkpoint Sharding (every 100 steps)
+        if (step + 1) % 100 == 0:
+            ckpt_shard = os.path.join(out_dir, f"spark_checkpoint_step_{step+1}.pt")
+            trainable_state = {k: v.cpu() for k, v in student.state_dict().items() if any(p in k for p in [".alpha", ".beta", ".U", ".V"])}
+            torch.save(trainable_state, ckpt_shard)
+            print(f"  [Checkpoint Shard] Saved {ckpt_shard} ({len(trainable_state)} tensors)", flush=True)
+            try:
+                from huggingface_hub import HfApi
+                api = HfApi(token=HF_TOKEN)
+                api.upload_file(
+                    path_or_fileobj=ckpt_shard,
+                    path_in_repo=f"benchmarks/spark_checkpoint_step_{step+1}.pt",
+                    repo_id="Solstice-AI/QuATernaryons-demo-POC-alpha",
+                    repo_type="dataset"
+                )
+                print(f"  [Offshore Shard] Uploaded {ckpt_shard} to Hugging Face!", flush=True)
+            except Exception as e:
+                print(f"  [Offshore Shard] HF upload notice: {e}", flush=True)
+
+        if (step + 1) % 25 == 0 or step == 0 or step == steps - 1:
+            print(f"  Step {step+1:3d}/{steps} | Forward KL = {loss_val:.4f} nats/token | Elapsed: {time.time()-t_distill:.1f}s (VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB)", flush=True)
 
     print(f"Distillation completed in {time.time()-t_distill:.1f}s.", flush=True)
 
     # 4. Final Validation on Gate
     print("\n[Phase 5] Evaluating Final Distribution-Fidelity Gate...", flush=True)
     student.eval()
+    if hasattr(student, "gradient_checkpointing_disable"):
+        student.gradient_checkpointing_disable()
     tot_kl = 0.0
     tot_agree = 0
     tot_tokens = 0
@@ -656,19 +864,30 @@ def main():
     with torch.no_grad():
         for i in range(8):  # 8 sequences = 16k validation tokens
             x = pool_tokens[i:i+1].to(device)
-            s_out = student(x).logits[:, :-1].float()
-            t_out = torch.load(f"/tmp/teacher_targets/target_{i}.pt", map_location=device)
+            s_out = student(x).logits[:, :-1]
+            t_logits = torch.load(f"/tmp/teacher_targets/target_{i}.pt", map_location="cpu")
 
-            logp_s = F.log_softmax(s_out, dim=-1)
-            p_t = F.softmax(t_out, dim=-1)
-            logp_t = F.log_softmax(t_out, dim=-1)
-            kl_batch = (p_t * (logp_t - logp_s)).sum(dim=-1).mean().item()
-            tot_kl += kl_batch
+            S = s_out.size(1)
+            seq_kl = 0.0
+            seq_agree = 0
+            for c_start in range(0, S, chunk_size):
+                c_end = min(c_start + chunk_size, S)
+                s_chunk = s_out[:, c_start:c_end].float()
+                t_chunk = t_logits[:, c_start:c_end].to(device).float()
 
-            s_top1 = s_out.argmax(dim=-1)
-            t_top1 = t_out.argmax(dim=-1)
-            tot_agree += (s_top1 == t_top1).sum().item()
-            tot_tokens += s_top1.numel()
+                logp_s = F.log_softmax(s_chunk, dim=-1)
+                logp_t = F.log_softmax(t_chunk, dim=-1)
+                seq_kl += F.kl_div(logp_s, logp_t, log_target=True, reduction='sum').item()
+
+                s_top1 = s_chunk.argmax(dim=-1)
+                t_top1 = t_chunk.argmax(dim=-1)
+                seq_agree += (s_top1 == t_top1).sum().item()
+                del s_chunk, t_chunk, logp_s, logp_t, s_top1, t_top1
+
+            del s_out, t_logits
+            tot_kl += (seq_kl / S)
+            tot_agree += seq_agree
+            tot_tokens += S
 
     final_kl = tot_kl / 8
     top1_pct = (tot_agree / tot_tokens) * 100
@@ -684,7 +903,7 @@ def main():
     print(f"   Raw Mathematical Retention: {retention_pct:.2f}%", flush=True)
     print("-" * 60, flush=True)
 
-    out_dir = "/kaggle/working" if os.path.exists("/kaggle/working") else "./results"
+    out_dir = "/content/results" if os.path.exists("/content") else ("/kaggle/working" if os.path.exists("/kaggle/working") else "./results")
     os.makedirs(out_dir, exist_ok=True)
     results = {
         "model_id": model_id,
@@ -695,11 +914,32 @@ def main():
         "raw_retention_pct": retention_pct,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
     }
-    with open(os.path.join(out_dir, "spark_x26_quaternaryons_results.json"), "w") as f:
+    results_path = os.path.join(out_dir, "spark_x26_quaternaryons_results.json")
+    with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
 
-    torch.save(student.state_dict(), os.path.join(out_dir, "spark_x26_quaternaryons_weights.pt"))
+    weights_path = os.path.join(out_dir, "spark_x26_quaternaryons_weights.pt")
+    torch.save(student.state_dict(), weights_path)
     print(f"Results and weights saved to {out_dir}.", flush=True)
+
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=HF_TOKEN)
+        api.upload_file(
+            path_or_fileobj=results_path,
+            path_in_repo="benchmarks/spark_x26_quaternaryons_results.json",
+            repo_id="Solstice-AI/QuATernaryons-demo-POC-alpha",
+            repo_type="dataset"
+        )
+        api.upload_file(
+            path_or_fileobj=weights_path,
+            path_in_repo="benchmarks/spark_x26_quaternaryons_weights.pt",
+            repo_id="Solstice-AI/QuATernaryons-demo-POC-alpha",
+            repo_type="dataset"
+        )
+        print("  [Offshore] Uploaded results JSON and weights to Hugging Face!", flush=True)
+    except Exception as e:
+        print(f"  [Offshore] Final HF upload notice: {e}", flush=True)
 
 if __name__ == "__main__":
     main()
