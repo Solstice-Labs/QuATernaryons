@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Offshore Vault](https://img.shields.io/badge/Hugging%20Face-Vault-FFD21E.svg)](https://huggingface.co/datasets/Solstice-AI/QuATernaryons-demo-POC-alpha)
 [![Mission Control](https://img.shields.io/badge/HF%20Space-Mission--Control-blueviolet.svg)](https://huggingface.co/spaces/Solstice-AI/Mission-Control)
-
+# NOTE: WIP, RESULTS PUBLISHED ON ZENODO, IMPROVEMENTS OTW
 **QuATernaryons** establishes the theoretical and computational foundation for sub-2-bit Large Language Model compression by lifting orthogonal channel mixing into the unit 3-sphere $\mathbb{S}^3$ of Hamilton quaternions. 
 
 By parameterizing orthogonal transformations through **4D left- and right-isoclinic Clifford rotors** arranged in an $\mathcal{O}(d \log_4 d)$ butterfly network, QuATernaryons achieves uniform activation diffusion with strictly zero numerical drift and exact adjoint invertibility.
